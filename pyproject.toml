@@ -1,7 +1,7 @@
 [project]
 name = "linkedin-messages-cli"
-version = "0.1.1"
-description = "Unofficial agent-native CLI for LinkedIn messaging (Chrome session). Sign in once, then list DMs and send with an explicit gate."
+version = "0.1.2"
+description = "Unofficial agent-native CLI for LinkedIn messaging (Chrome session). Sign in once, then list/read DMs and send with an explicit gate."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"

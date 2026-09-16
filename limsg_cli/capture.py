@@ -88,7 +88,6 @@ def save_capture(
     method: str,
     status: int | None,
     request_body_keys: list[str] | None = None,
-    request_message_keys: list[str] | None = None,
     response_shape: Any = None,
 ) -> Path:
     ensure_dirs()
@@ -103,7 +102,6 @@ def save_capture(
         "status": status,
         "url": summarize_url(url),
         "requestBodyKeys": request_body_keys or [],
-        "requestMessageKeys": request_message_keys or [],
         "responseShape": _scrub(response_shape) if response_shape is not None else None,
     }
     path.write_text(json.dumps(payload, indent=2, default=str) + "\n")
@@ -122,18 +120,9 @@ def load_latest_query_ids() -> dict[str, str]:
             data = json.loads(f.read_text())
         except Exception:
             continue
-        if not isinstance(data, dict):
+        qid = (data.get("url") or {}).get("queryId")
+        if not qid or "." not in qid:
             continue
-        url = data.get("url")
-        qid = None
-        if isinstance(url, dict):
-            qid = url.get("queryId")
-        elif isinstance(url, str) and "queryId=" in url:
-            import re as _re
-            m = _re.search(r"queryId=([^&]+)", url)
-            qid = m.group(1) if m else None
-        if not qid or "." not in str(qid):
-            continue
-        name = str(qid).split(".", 1)[0]
+        name = qid.split(".", 1)[0]
         found.setdefault(name, qid)
     return found

@@ -1,5 +1,6 @@
 #!/bin/bash
 # Run ON Codefi Mac (kk). Does NOT touch chrome-profile or kill Chrome.
+# READ-ONLY LinkedIn smoke: list + history. Never calls messages send.
 set -euo pipefail
 REPO="${1:-/Users/kk/Sites/truefrontier/linkedin-messages-cli}"
 STATUS="$HOME/.linkedin-messages-cli/login-status.txt"
@@ -31,10 +32,10 @@ done
 
 pipx install --force "$REPO"
 command -v limsg
-limsg --help | head -20
+limsg --version
 
 limsg messages list --limit 10 --compact > /tmp/limsg-list.json 2>/tmp/limsg-list.err || true
-echo "--- stderr ---"; cat /tmp/limsg-list.err || true
+echo "--- list stderr ---"; cat /tmp/limsg-list.err || true
 python3 - <<'PY2'
 import json,sys
 p="/tmp/limsg-list.json"
@@ -50,3 +51,35 @@ print("THREAD_COUNT", len(data))
 boardy=any("boardy" in str(r.get("peer") or "").lower() for r in data)
 print("BOARDY_IN_TITLES", boardy)
 PY2
+
+# READ-ONLY history smoke (no send)
+limsg messages history Boardy --limit 5 --format json > /tmp/limsg-hist.json 2>/tmp/limsg-hist.err || true
+echo "--- history stderr ---"; cat /tmp/limsg-hist.err || true
+python3 - <<'PY3'
+import json,sys
+p="/tmp/limsg-hist.json"
+try:
+  data=json.load(open(p))
+except Exception as e:
+  print("HIST_PARSE_FAIL", e)
+  sys.exit(5)
+if not isinstance(data, list):
+  print("HIST_UNEXPECTED", type(data).__name__)
+  sys.exit(5)
+print("MSG_COUNT", len(data))
+need=("time","from","text")
+ok=all(isinstance(r,dict) and all(k in r for k in need) for r in data) if data else False
+print("FIELDS_OK", ok)
+# Do not print message bodies
+if data:
+  print("SAMPLE_KEYS", sorted(data[0].keys()))
+  print("FROM_VALUES", sorted({str(r.get("from")) for r in data}))
+PY3
+
+# Alias check
+limsg messages read Boardy --limit 1 --format json > /tmp/limsg-read.json 2>/tmp/limsg-read.err || true
+python3 - <<'PY4'
+import json
+d=json.load(open("/tmp/limsg-read.json"))
+print("READ_ALIAS_COUNT", len(d) if isinstance(d,list) else type(d).__name__)
+PY4

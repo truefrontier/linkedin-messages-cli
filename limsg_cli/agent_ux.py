@@ -134,4 +134,3 @@ def agent_output_options(
         return f
 
     return decorator
-

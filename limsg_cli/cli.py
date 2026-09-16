@@ -28,6 +28,7 @@ from limsg_cli.agent_ux import (
 )
 from limsg_cli.api import (
     attach_response_sniffer,
+    get_messages,
     list_conversations,
     send_message,
 )
@@ -41,6 +42,8 @@ from limsg_cli.browser import (
 console = Console(stderr=True)
 
 COMPACT_FIELDS = ("id", "peer", "time", "unread", "preview")
+MSG_COMPACT_FIELDS = ("time", "from", "text")
+MSG_TABLE_FIELDS = ("time", "from", "text")
 
 
 def _need_session() -> None:
@@ -187,6 +190,90 @@ def _resolve_thread(rows: list[dict], thread_or_person: str) -> dict | None:
     return None
 
 
+
+def _truncate(s: str, n: int = 72) -> str:
+    s = s or ""
+    s = s.replace("\n", " ").strip()
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def _emit_messages(
+    rows: list[dict],
+    *,
+    fmt: str | None,
+    compact: bool,
+    select: str | None,
+    quiet: bool,
+    as_csv: bool,
+) -> None:
+    fields = list(MSG_COMPACT_FIELDS)
+    if as_csv:
+        data = select_fields(rows, select) if select else rows
+        if isinstance(data, list):
+            emit_csv(data, fields=fields if not select else None)
+        return
+    fmt = resolve_format(fmt)
+    data: Any = rows
+    if compact:
+        data = compact_rows(rows, MSG_COMPACT_FIELDS)
+    data = select_fields(data, select)
+    if fmt == "json":
+        emit_json(data)
+    else:
+        table = Table(title="LinkedIn messages")
+        cols = list(MSG_TABLE_FIELDS)
+        for c in cols:
+            table.add_column(c)
+        for r in rows:
+            vals = []
+            for c in cols:
+                v = r.get(c, "")
+                if v is None:
+                    v = ""
+                s = str(v)
+                if c == "text":
+                    s = _truncate(s, 72)
+                elif c == "time":
+                    s = s[:19] + ("Z" if s.endswith("Z") and len(s) > 19 else "")
+                    if len(s) > 25:
+                        s = s[:25]
+                vals.append(s)
+            table.add_row(*vals)
+        Console().print(table)
+    note_showing(len(rows), quiet=quiet, noun="messages")
+
+
+async def _history_async(thread_or_person: str, limit: int) -> list[dict]:
+    p, context, page = await _with_messaging_page(headless=True)
+    try:
+        # Search window for name resolution
+        search_limit = max(limit, 50)
+        threads = await list_conversations(page, limit=search_limit, do_capture=False)
+        target = _resolve_thread(threads, thread_or_person)
+        if not target:
+            # Allow raw thread id / URN even if not in recent list window
+            q = thread_or_person.strip()
+            if q.startswith("urn:li:") or q.startswith("2-"):
+                target = {"id": q, "entityUrn": q if q.startswith("urn:li:") else "", "peer": ""}
+            else:
+                die(
+                    f"No thread matching {thread_or_person!r}.",
+                    EXIT_NOT_FOUND,
+                    hint="Run: limsg messages list --compact",
+                )
+        conv = target.get("entityUrn") or target.get("id") or ""
+        return await get_messages(
+            page,
+            conv,
+            limit=limit,
+            do_capture=True,
+            peer_hint=(target.get("peer") or None),
+        )
+    finally:
+        await context.close()
+        await p.stop()
+
+
 @click.group()
 @click.version_option(__version__, prog_name="limsg")
 def main() -> None:
@@ -206,7 +293,7 @@ def login_cmd() -> None:
 
 @main.group("messages")
 def messages_group() -> None:
-    """List and send LinkedIn DMs."""
+    """List, read, and send LinkedIn DMs."""
 
 
 @messages_group.command("list")
@@ -236,6 +323,70 @@ def messages_list(
         as_csv=as_csv,
     )
     raise SystemExit(EXIT_OK)
+
+
+
+
+def _messages_history_impl(
+    thread_or_person: str,
+    limit: int,
+    fmt: str | None,
+    compact: bool,
+    select: str | None,
+    quiet: bool,
+    as_csv: bool,
+) -> None:
+    try:
+        rows = asyncio.run(_history_async(thread_or_person, limit=limit))
+    except SystemExit:
+        raise
+    except Exception as e:
+        die(str(e), EXIT_API)
+    _emit_messages(
+        rows,
+        fmt=fmt,
+        compact=compact,
+        select=select,
+        quiet=quiet,
+        as_csv=as_csv,
+    )
+    raise SystemExit(EXIT_OK)
+
+
+@messages_group.command("history")
+@click.argument("thread_or_person")
+@click.option("--limit", default=20, show_default=True, type=int, help="Max messages (most recent).")
+@agent_output_options(formats=("table", "json"))
+def messages_history(
+    thread_or_person: str,
+    limit: int,
+    fmt: str | None,
+    compact: bool,
+    select: str | None,
+    quiet: bool,
+    as_csv: bool,
+) -> None:
+    """Read last N messages in a thread (who / text / time). READ-ONLY."""
+    _messages_history_impl(thread_or_person, limit, fmt, compact, select, quiet, as_csv)
+
+
+@messages_group.command("read")
+@click.argument("thread_or_person")
+@click.option("--limit", default=20, show_default=True, type=int, help="Max messages (most recent).")
+@agent_output_options(formats=("table", "json"))
+def messages_read(
+    thread_or_person: str,
+    limit: int,
+    fmt: str | None,
+    compact: bool,
+    select: str | None,
+    quiet: bool,
+    as_csv: bool,
+) -> None:
+    """Alias for `messages history` — last N messages (READ-ONLY)."""
+    _messages_history_impl(thread_or_person, limit, fmt, compact, select, quiet, as_csv)
+
+
 
 
 @messages_group.command("send")
