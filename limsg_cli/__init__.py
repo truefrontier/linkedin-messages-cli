@@ -1,3 +1,3 @@
 """Unofficial LinkedIn Messages CLI (Chrome session)."""
 
-__version__ = "0.1.2"
+__version__ = "0.1.4"

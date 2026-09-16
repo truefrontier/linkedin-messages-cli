@@ -1,6 +1,6 @@
 [project]
 name = "linkedin-messages-cli"
-version = "0.1.2"
+version = "0.1.4"
 description = "Unofficial agent-native CLI for LinkedIn messaging (Chrome session). Sign in once, then list/read DMs and send with an explicit gate."
 readme = "README.md"
 license = "MIT"

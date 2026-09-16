@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import uuid
 from typing import Any
 from urllib.parse import quote
 
@@ -24,21 +25,28 @@ REST_EVENTS = "/voyager/api/messaging/conversations"
 MESSAGING_GQL = "/voyager/api/voyagerMessagingGraphQL/graphql"
 
 
+def _textish(val: Any) -> str:
+    if val is None:
+        return ""
+    if isinstance(val, str):
+        return val.strip()
+    if isinstance(val, dict):
+        for k in ("text", "value", "localized", "name"):
+            if k in val:
+                return _textish(val.get(k))
+        return ""
+    return str(val).strip()
+
+
 def _name_from_member(member: dict | None) -> str:
     if not isinstance(member, dict):
         return ""
     # Newer messenger shape: firstName/lastName as {text: ...}
-    fn = member.get("firstName")
-    ln = member.get("lastName")
-    if isinstance(fn, dict):
-        fn = fn.get("text") or ""
-    if isinstance(ln, dict):
-        ln = ln.get("text") or ""
-    fn = (fn or "").strip()
-    ln = (ln or "").strip()
+    fn = _textish(member.get("firstName"))
+    ln = _textish(member.get("lastName"))
     if fn or ln:
         return f"{fn} {ln}".strip()
-    return (member.get("name") or member.get("publicIdentifier") or "").strip()
+    return _textish(member.get("name") or member.get("publicIdentifier") or "")
 
 
 def _preview_from_conv(conv: dict) -> str:
@@ -46,17 +54,16 @@ def _preview_from_conv(conv: dict) -> str:
         lm = conv.get(key)
         if isinstance(lm, dict):
             for tkey in ("text", "body", "snippet"):
-                if isinstance(lm.get(tkey), str):
-                    return lm[tkey][:160]
+                s = _textish(lm.get(tkey))
+                if s:
+                    return s[:160]
             ab = lm.get("attributedBody") or lm.get("body")
-            if isinstance(ab, dict) and isinstance(ab.get("text"), str):
-                return ab["text"][:160]
+            s = _textish(ab)
+            if s:
+                return s[:160]
         if isinstance(lm, str):
             return lm[:160]
-    # event content
-    ec = conv.get("events") or conv.get("*events")
     return ""
-
 
 def parse_conversations_payload(data: Any) -> list[dict]:
     """Normalize GraphQL or REST conversation list → agent rows."""
@@ -302,18 +309,45 @@ async def send_message(
     mailbox_urn: str | None = None,
     do_capture: bool = True,
 ) -> dict:
+    """POST createMessage using the dash MessengerMessages body the web UI sends.
+
+    Captured UI shape (2026-09):
+      {
+        message: {
+          body: { attributes: [], text },
+          renderContentUnions: [],
+          conversationUrn,
+          originToken  # uuid4
+        },
+        mailboxUrn,
+        trackingId,  # 16-char token
+        dedupeByClientGeneratedToken: false
+      }
+    """
     mailbox = mailbox_urn or await discover_mailbox_urn(page)
     if not mailbox:
         raise RuntimeError("Could not resolve mailboxUrn")
-    body: dict[str, Any] = {
-        "body": {"text": text},
-        "mailboxUrn": mailbox,
+    if not conversation_urn and not recipient_profile_urns:
+        raise RuntimeError("Need conversationUrn or recipientProfileUrns")
+
+    origin = str(uuid.uuid4())
+    tracking = uuid.uuid4().hex[:16]
+
+    message: dict[str, Any] = {
+        "body": {"attributes": [], "text": text},
+        "renderContentUnions": [],
+        "originToken": origin,
     }
-    # LinkedIn variants — keep both keys some clients accept
-    body["message"] = {"body": {"text": text}}
     if conversation_urn:
-        body["conversationUrn"] = conversation_urn
-    if recipient_profile_urns:
+        message["conversationUrn"] = conversation_urn
+
+    body: dict[str, Any] = {
+        "message": message,
+        "mailboxUrn": mailbox,
+        "trackingId": tracking,
+        "dedupeByClientGeneratedToken": False,
+    }
+    if recipient_profile_urns and not conversation_urn:
         body["recipientProfileUrns"] = recipient_profile_urns
 
     url = f"https://www.linkedin.com{SEND_PATH}"
@@ -325,13 +359,23 @@ async def send_message(
             method="POST",
             status=status,
             request_body_keys=sorted(body.keys()),
-            response_shape=data if status < 400 else {"error": True, "status": status},
+            request_message_keys=sorted(message.keys()),
+            response_shape=(
+                data
+                if status < 400
+                else {
+                    "error": True,
+                    "status": status,
+                    "response_keys": list(data.keys()) if isinstance(data, dict) else type(data).__name__,
+                }
+            ),
         )
     if status >= 400:
-        raise RuntimeError(f"Send failed HTTP {status}")
-    return {"status": status, "ok": True}
-
-
+        detail = ""
+        if isinstance(data, dict):
+            detail = str(data.get("message") or data.get("code") or data.get("status") or "")[:200]
+        raise RuntimeError(f"Send failed HTTP {status}" + (f": {detail}" if detail else ""))
+    return {"status": status, "ok": True, "originToken": origin}
 
 
 def _ms_to_iso(value: Any) -> str:
@@ -407,29 +451,31 @@ def _sender_name_and_urn(obj: dict, by_urn: dict[str, dict]) -> tuple[str, str]:
     sender_urn = ""
     name = ""
 
-    sender = obj.get("sender")
+    def _name_from_participant(ref: dict | None) -> str:
+        if not isinstance(ref, dict):
+            return ""
+        pt = ref.get("participantType") or {}
+        if isinstance(pt, dict):
+            for key in ("member", "organization", "agent"):
+                cand = pt.get(key)
+                if isinstance(cand, dict):
+                    n = _name_from_member(cand)
+                    if n:
+                        return n
+        n = _name_from_member(ref.get("member") or ref.get("miniProfile") or ref)
+        return n
+
+    # GraphQL messenger.Message uses *sender / *actor (plain sender is often absent)
+    sender = obj.get("sender") or obj.get("*sender") or obj.get("actor") or obj.get("*actor")
     if isinstance(sender, str):
         sender_urn = sender
         ref = by_urn.get(sender) or {}
-        name = _name_from_member(ref) or _name_from_member(
-            (ref.get("participantType") or {}).get("member")
-            if isinstance(ref.get("participantType"), dict)
-            else None
-        )
-        if not name and isinstance(ref, dict):
-            pt = ref.get("participantType") or {}
-            if isinstance(pt, dict):
-                name = _name_from_member(pt.get("member") or pt.get("organization"))
-            mini = ref.get("miniProfile") or ref.get("member")
-            if isinstance(mini, dict):
-                name = name or _name_from_member(mini)
+        name = _name_from_participant(ref)
     elif isinstance(sender, dict):
         sender_urn = str(sender.get("entityUrn") or sender.get("backendUrn") or "")
-        pt = sender.get("participantType") or {}
-        if isinstance(pt, dict):
-            name = _name_from_member(pt.get("member") or pt.get("organization"))
-        if not name:
-            name = _name_from_member(sender.get("member") or sender.get("miniProfile") or sender)
+        name = _name_from_participant(sender)
+        if not name and sender_urn:
+            name = _name_from_participant(by_urn.get(sender_urn))
 
     # REST Event: *from / from
     if not name:
@@ -437,12 +483,12 @@ def _sender_name_and_urn(obj: dict, by_urn: dict[str, dict]) -> tuple[str, str]:
         if isinstance(from_ref, str):
             sender_urn = sender_urn or from_ref
             ref = by_urn.get(from_ref) or {}
-            if isinstance(ref, dict):
+            name = _name_from_participant(ref) if ref else ""
+            if not name and isinstance(ref, dict):
                 mini = ref.get("miniProfile") or ref.get("member") or ref
                 if isinstance(mini, str):
                     mini = by_urn.get(mini) or {}
                 name = _name_from_member(mini if isinstance(mini, dict) else None)
-                # MessagingMember often has *miniProfile pointer
                 mp = ref.get("*miniProfile") or ref.get("miniProfile")
                 if not name and isinstance(mp, str):
                     name = _name_from_member(by_urn.get(mp))
@@ -703,11 +749,12 @@ async def get_messages(
             f"Voyager messages failed HTTP {last_status} for {last_url.split('?')[0]}"
         )
 
-    # Relabel unknown peer as peer_hint when only one non-me participant
+    # Relabel unknown peer using thread title hint (prefer first name before comma)
     if peer_hint:
+        hint = peer_hint.split(",")[0].strip() or peer_hint
         for r in rows:
-            if r.get("from") in {"", "peer"} and r.get("from") != "me":
-                r["from"] = peer_hint
+            if r.get("from") in {"", "peer"}:
+                r["from"] = hint
 
     # Last N (most recent), chronological ascending for reading
     if len(rows) > limit:
