@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import uuid
 from typing import Any
 from urllib.parse import quote
 
@@ -307,34 +308,76 @@ async def send_message(
     mailbox_urn: str | None = None,
     do_capture: bool = True,
 ) -> dict:
+    """POST createMessage using the dash MessengerMessages body the web UI sends.
+
+    Captured UI shape (2026-09):
+      {
+        message: {
+          body: { attributes: [], text },
+          renderContentUnions: [],
+          conversationUrn,
+          originToken  # uuid4
+        },
+        mailboxUrn,
+        trackingId,  # 16-char token
+        dedupeByClientGeneratedToken: false
+      }
+    """
     mailbox = mailbox_urn or await discover_mailbox_urn(page)
     if not mailbox:
         raise RuntimeError("Could not resolve mailboxUrn")
-    body: dict[str, Any] = {
-        "body": {"text": text},
-        "mailboxUrn": mailbox,
+    if not conversation_urn and not recipient_profile_urns:
+        raise RuntimeError("Need conversationUrn or recipientProfileUrns")
+
+    origin = str(uuid.uuid4())
+    # UI uses a short opaque tracking id; uuid hex slice is accepted in practice.
+    tracking = uuid.uuid4().hex[:16]
+
+    message: dict[str, Any] = {
+        "body": {"attributes": [], "text": text},
+        "renderContentUnions": [],
+        "originToken": origin,
     }
-    # LinkedIn variants — keep both keys some clients accept
-    body["message"] = {"body": {"text": text}}
     if conversation_urn:
-        body["conversationUrn"] = conversation_urn
-    if recipient_profile_urns:
+        message["conversationUrn"] = conversation_urn
+
+    body: dict[str, Any] = {
+        "message": message,
+        "mailboxUrn": mailbox,
+        "trackingId": tracking,
+        "dedupeByClientGeneratedToken": False,
+    }
+    # New-thread path (no conversation yet)
+    if recipient_profile_urns and not conversation_urn:
         body["recipientProfileUrns"] = recipient_profile_urns
 
     url = f"https://www.linkedin.com{SEND_PATH}"
     status, data = await _page_fetch(page, url, method="POST", body=body)
     if do_capture:
+        # Store keys + nested message keys only (never message text).
         save_capture(
             kind="send_createMessage",
             url=url,
             method="POST",
             status=status,
             request_body_keys=sorted(body.keys()),
-            response_shape=data if status < 400 else {"error": True, "status": status},
+            request_message_keys=sorted(message.keys()),
+            response_shape=(
+                data
+                if status < 400
+                else {
+                    "error": True,
+                    "status": status,
+                    "response_keys": list(data.keys()) if isinstance(data, dict) else type(data).__name__,
+                }
+            ),
         )
     if status >= 400:
-        raise RuntimeError(f"Send failed HTTP {status}")
-    return {"status": status, "ok": True}
+        detail = ""
+        if isinstance(data, dict):
+            detail = str(data.get("message") or data.get("code") or data.get("status") or "")[:200]
+        raise RuntimeError(f"Send failed HTTP {status}" + (f": {detail}" if detail else ""))
+    return {"status": status, "ok": True, "originToken": origin}
 
 
 async def attach_response_sniffer(page: Page) -> list[dict]:
