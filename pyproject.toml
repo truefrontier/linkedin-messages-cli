@@ -1,0 +1,24 @@
+[project]
+name = "linkedin-messages-cli"
+version = "0.1.0"
+description = "Unofficial agent-native CLI for LinkedIn messaging (Chrome session). Sign in once, then list DMs and send with an explicit gate."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [{ name = "True Frontier" }]
+dependencies = [
+    "playwright>=1.40.0",
+    "click>=8.1.0",
+    "rich>=13.0.0",
+]
+
+[project.scripts]
+limsg = "limsg_cli.cli:main"
+linkedin-messages = "limsg_cli.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["limsg_cli"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
