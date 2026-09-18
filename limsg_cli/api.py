@@ -353,23 +353,27 @@ async def send_message(
     url = f"https://www.linkedin.com{SEND_PATH}"
     status, data = await _page_fetch(page, url, method="POST", body=body)
     if do_capture:
-        save_capture(
-            kind="send_createMessage",
-            url=url,
-            method="POST",
-            status=status,
-            request_body_keys=sorted(body.keys()),
-            request_message_keys=sorted(message.keys()),
-            response_shape=(
-                data
-                if status < 400
-                else {
-                    "error": True,
-                    "status": status,
-                    "response_keys": list(data.keys()) if isinstance(data, dict) else type(data).__name__,
-                }
-            ),
-        )
+        try:
+            save_capture(
+                kind="send_createMessage",
+                url=url,
+                method="POST",
+                status=status,
+                request_body_keys=sorted(body.keys()),
+                request_message_keys=sorted(message.keys()),
+                response_shape=(
+                    data
+                    if status < 400
+                    else {
+                        "error": True,
+                        "status": status,
+                        "response_keys": list(data.keys()) if isinstance(data, dict) else type(data).__name__,
+                    }
+                ),
+            )
+        except Exception:
+            # Never fail a successful send because scrubbed capture logging broke.
+            pass
     if status >= 400:
         detail = ""
         if isinstance(data, dict):

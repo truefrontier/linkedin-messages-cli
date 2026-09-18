@@ -88,6 +88,7 @@ def save_capture(
     method: str,
     status: int | None,
     request_body_keys: list[str] | None = None,
+    request_message_keys: list[str] | None = None,
     response_shape: Any = None,
 ) -> Path:
     ensure_dirs()
@@ -102,6 +103,7 @@ def save_capture(
         "status": status,
         "url": summarize_url(url),
         "requestBodyKeys": request_body_keys or [],
+        "requestMessageKeys": request_message_keys or [],
         "responseShape": _scrub(response_shape) if response_shape is not None else None,
     }
     path.write_text(json.dumps(payload, indent=2, default=str) + "\n")
