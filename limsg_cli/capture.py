@@ -11,13 +11,21 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import parse_qs, unquote, urlparse
 
 from limsg_cli.browser import CAPTURE, ensure_dirs
 
 INTERESTING = re.compile(
     r"(voyagerMessagingGraphQL|/messaging/conversations|MessengerMessages|"
-    r"voyagerMessagingDash|messengerConversations|messengerMessages)",
+    r"voyagerMessagingDash|messengerConversations|messengerMessages|"
+    r"voyagerIdentityDash|voyagerFeedDash|voyagerSocialDash|"
+    r"profileUpdates|ProfileUpdates|"
+    r"/voyager/api/identity/|/voyager/api/feed/|/voyager/api/social/|"
+    r"/voyager/api/graphql|"
+    r"memberComments|memberReactions|memberShareFeed|memberFeed|"
+    r"recent-activity|profileActivity|member-activity|"
+    r"flagship-web/feed|flagship-web/in/|"
+    r"comment|reaction|activity)",
     re.I,
 )
 
@@ -66,6 +74,18 @@ def path_only(url: str) -> str:
     return p.path
 
 
+def _scrub_qs_value(key: str, value: str) -> str:
+    """Keep structural query params; strip profile ids and URNs."""
+    if key == "queryId":
+        return value
+    v = unquote(value)
+    v = re.sub(r"urn:li:[A-Za-z0-9_.-]+:[A-Za-z0-9_-]+", "<urn>", v)
+    v = re.sub(r"ACoAA[A-Za-z0-9_-]+", "<id>", v)
+    if len(v) > 240:
+        v = v[:240] + "…"
+    return v
+
+
 def summarize_url(url: str) -> dict[str, Any]:
     p = urlparse(url)
     qs = parse_qs(p.query)
@@ -74,6 +94,7 @@ def summarize_url(url: str) -> dict[str, Any]:
         "path": p.path,
         "queryId": query_id,
         "query_keys": sorted(qs.keys()),
+        "query": {k: _scrub_qs_value(k, vs[0]) for k, vs in qs.items() if vs},
     }
 
 
@@ -93,9 +114,13 @@ def save_capture(
 ) -> Path:
     ensure_dirs()
     CAPTURE.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     safe_kind = re.sub(r"[^a-zA-Z0-9_-]+", "_", kind)[:60]
     path = CAPTURE / f"{stamp}_{safe_kind}.json"
+    n = 0
+    while path.exists():
+        n += 1
+        path = CAPTURE / f"{stamp}_{safe_kind}_{n}.json"
     payload = {
         "capturedAt": stamp,
         "kind": kind,
