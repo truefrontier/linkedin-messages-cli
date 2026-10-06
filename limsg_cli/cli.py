@@ -26,6 +26,13 @@ from limsg_cli.agent_ux import (
     resolve_format,
     select_fields,
 )
+from limsg_cli.activity import (
+    AuthRequired,
+    ProfileBusy,
+    fetch_activity,
+    fetch_export,
+    parse_since,
+)
 from limsg_cli.api import (
     attach_response_sniffer,
     get_messages,
@@ -451,6 +458,175 @@ def messages_send(thread_or_person: str, text: str, do_send: bool, limit: int) -
         raise SystemExit(EXIT_OK)
     click.echo("SENT", err=True)
     emit_json(out)
+    raise SystemExit(EXIT_OK)
+
+
+COMMENT_FIELDS = ("id", "time", "type", "text", "targetUrl", "targetTitle")
+REACTION_FIELDS = ("id", "time", "type", "reaction", "targetUrl", "targetTitle")
+POST_FIELDS = ("id", "time", "type", "text", "url")
+ACTIVITY_FIELDS = {
+    "comments": COMMENT_FIELDS,
+    "reactions": REACTION_FIELDS,
+    "posts": POST_FIELDS,
+}
+ACTIVITY_COMPACT = {
+    "comments": ("id", "time", "type", "text"),
+    "reactions": ("id", "time", "type", "reaction"),
+    "posts": ("id", "time", "type", "text"),
+}
+
+
+def _run_activity(coro):
+    try:
+        return asyncio.run(coro)
+    except AuthRequired as exc:
+        die(str(exc), EXIT_AUTH, hint="Run: limsg login")
+    except ProfileBusy as exc:
+        die(str(exc), EXIT_API)
+    except ValueError as exc:
+        die(str(exc), EXIT_USAGE)
+    except SystemExit:
+        raise
+    except Exception as exc:
+        die(str(exc), EXIT_API)
+
+
+def _emit_activity(kind: str, rows: list[dict], *, fmt, compact, select, quiet, as_csv) -> None:
+    fields = list(ACTIVITY_COMPACT[kind] if compact else ACTIVITY_FIELDS[kind])
+    if as_csv:
+        data = select_fields(rows, select) if select else rows
+        if isinstance(data, list):
+            emit_csv(data, fields=fields if not select else None)
+        return
+    fmt = resolve_format(fmt)
+    data: Any = compact_rows(rows, fields) if compact else rows
+    data = select_fields(data, select)
+    if fmt == "json":
+        emit_json(data)
+    else:
+        table = Table(title=f"LinkedIn {kind}")
+        for col in fields:
+            table.add_column(col)
+        for row in rows:
+            vals = []
+            for col in fields:
+                text = str(row.get(col) or "")
+                if col in {"text", "targetTitle", "targetUrl", "url"}:
+                    text = _truncate(text, 72)
+                vals.append(text)
+            table.add_row(*vals)
+        Console().print(table)
+    note_showing(len(rows), quiet=quiet, noun=kind)
+
+
+def _activity_list(kind: str, limit: int, since: str | None, fmt, compact, select, quiet, as_csv) -> None:
+    since_dt = parse_since(since)
+    rows = _run_activity(fetch_activity(kind, limit=limit, since=since_dt))
+    _emit_activity(kind, rows, fmt=fmt, compact=compact, select=select, quiet=quiet, as_csv=as_csv)
+    raise SystemExit(EXIT_OK)
+
+
+@main.group("activity")
+def activity_group() -> None:
+    """Read-only recent activity: comments, reactions, and your posts."""
+
+
+def _activity_options(fn):
+    fn = click.option("--limit", default=20, show_default=True, type=int, help="Max rows.")(fn)
+    fn = click.option("--since", default=None, help="Only rows at or after this ISO-8601 time.")(fn)
+    return fn
+
+
+@activity_group.command("comments")
+@_activity_options
+@agent_output_options(formats=("table", "json"))
+def activity_comments(limit, since, fmt, compact, select, quiet, as_csv) -> None:
+    """Your recent comments (READ-ONLY)."""
+    _activity_list("comments", limit, since, fmt, compact, select, quiet, as_csv)
+
+
+@activity_group.command("reactions")
+@_activity_options
+@agent_output_options(formats=("table", "json"))
+def activity_reactions(limit, since, fmt, compact, select, quiet, as_csv) -> None:
+    """Your recent reactions (READ-ONLY)."""
+    _activity_list("reactions", limit, since, fmt, compact, select, quiet, as_csv)
+
+
+@activity_group.command("posts")
+@_activity_options
+@agent_output_options(formats=("table", "json"))
+def activity_posts(limit, since, fmt, compact, select, quiet, as_csv) -> None:
+    """Your recent posts and shares (READ-ONLY)."""
+    _activity_list("posts", limit, since, fmt, compact, select, quiet, as_csv)
+
+
+_EXPORT_FIELDS = (
+    "kind",
+    "id",
+    "time",
+    "type",
+    "text",
+    "reaction",
+    "targetUrl",
+    "targetTitle",
+    "url",
+)
+
+
+@activity_group.command("export")
+@click.option("--limit", default=20, show_default=True, type=int, help="Max rows per kind.")
+@click.option("--since", default=None, help="Only rows at or after this ISO-8601 time.")
+@click.option("--out", "out_path", default=None, type=click.Path(dir_okay=False), help="Write to PATH instead of stdout.")
+@click.option("--format", "fmt", type=click.Choice(["json", "csv"]), default="json", show_default=True)
+@click.option("--compact", is_flag=True, help="High-gravity fields only.")
+@click.option("--select", default=None, help="Comma-separated fields.")
+@click.option("--quiet", "-q", is_flag=True, help="Suppress non-data messages on stderr.")
+@click.option("--csv", "as_csv", is_flag=True, help="CSV to stdout (same as --format csv).")
+def activity_export(limit, since, out_path, fmt, compact, select, quiet, as_csv) -> None:
+    """Bundle comments, reactions, and posts. JSON object or CSV with a kind column. READ-ONLY."""
+    since_dt = parse_since(since)
+    bundle = _run_activity(fetch_export(limit=limit, since=since_dt))
+    if as_csv:
+        fmt = "csv"
+    if compact:
+        slim = {}
+        for kind, rows in bundle.items():
+            slim[kind] = compact_rows(rows, ACTIVITY_COMPACT[kind])
+        bundle = slim
+    if select:
+        bundle = {kind: select_fields(rows, select) for kind, rows in bundle.items()}
+    flat = []
+    for kind, rows in bundle.items():
+        for row in rows:
+            item = {"kind": kind}
+            item.update(row)
+            flat.append(item)
+    if fmt == "csv":
+        if out_path:
+            import csv
+
+            with open(out_path, "w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=list(_EXPORT_FIELDS), extrasaction="ignore")
+                writer.writeheader()
+                for row in flat:
+                    writer.writerow({key: row.get(key) for key in _EXPORT_FIELDS})
+            if not quiet:
+                click.echo(f"Wrote {out_path}", err=True)
+        else:
+            emit_csv(flat, fields=_EXPORT_FIELDS if not select else None)
+    else:
+        payload = bundle
+        if out_path:
+            import json
+
+            with open(out_path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2, default=str)
+                handle.write("\n")
+            if not quiet:
+                click.echo(f"Wrote {out_path}", err=True)
+        else:
+            emit_json(payload)
     raise SystemExit(EXIT_OK)
 
 

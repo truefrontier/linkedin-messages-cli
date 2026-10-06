@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     from playwright.async_api import Page
 
 from limsg_cli.browser import csrf_from_cookies, voyager_headers
-from limsg_cli.capture import is_interesting, load_latest_query_ids, save_capture
+from limsg_cli.capture import is_interesting, load_latest_query_ids, save_capture, summarize_url
 
 # Known defaults (may rotate; capture + page discovery preferred).
 DEFAULT_CONV_QUERY = "messengerConversations.0d5e6781bbee71c3e51c8843c6519f48"
@@ -790,7 +790,17 @@ async def attach_response_sniffer(page: Page) -> list[dict]:
                 status=status,
                 response_shape=shape,
             )
-            hits.append({"path": str(path), "url_path": url.split("?")[0], "status": status})
+            info = summarize_url(url)
+            hits.append(
+                {
+                    "path": str(path),
+                    "url_path": info.get("path"),
+                    "queryId": info.get("queryId"),
+                    "query": info.get("query"),
+                    "status": status,
+                    "method": method,
+                }
+            )
         except Exception:
             return
 
