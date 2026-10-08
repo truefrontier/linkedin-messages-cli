@@ -25,6 +25,7 @@ INTERESTING = re.compile(
     r"memberComments|memberReactions|memberShareFeed|memberFeed|"
     r"recent-activity|profileActivity|member-activity|"
     r"flagship-web/feed|flagship-web/in/|"
+    r"campaign-manager-api|campaignManager|adAnalytics|"
     r"comment|reaction|activity)",
     re.I,
 )
