@@ -21,8 +21,6 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urljoin
 
-from playwright.async_api import async_playwright
-
 from limsg_cli.api import attach_response_sniffer
 from limsg_cli.browser import has_session, open_context
 from limsg_cli.capture import save_capture
@@ -96,7 +94,7 @@ def assert_profile_idle() -> None:
         )
 
 
-def parse_since(value: str | None) -> datetime | None:
+def parse_since(value: str | None, *, flag: str = "--since") -> datetime | None:
     if not value:
         return None
     raw = value.strip()
@@ -105,7 +103,7 @@ def parse_since(value: str | None) -> datetime | None:
     try:
         dt = datetime.fromisoformat(raw)
     except ValueError as exc:
-        raise ValueError("Invalid --since. Use ISO-8601, for example 2026-10-01 or 2026-10-01T00:00:00Z.") from exc
+        raise ValueError(f"Invalid {flag}. Use ISO-8601, for example 2026-10-01 or 2026-10-01T00:00:00Z.") from exc
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
@@ -473,6 +471,8 @@ async def fetch_activity(
     if not has_session():
         raise AuthRequired("No LinkedIn session found.")
     assert_profile_idle()
+    from playwright.async_api import async_playwright
+
     async with async_playwright() as p:
         context = await open_context(p, headless=headless)
         page = context.pages[0] if context.pages else await context.new_page()
@@ -494,6 +494,8 @@ async def fetch_export(
     if not has_session():
         raise AuthRequired("No LinkedIn session found.")
     assert_profile_idle()
+    from playwright.async_api import async_playwright
+
     async with async_playwright() as p:
         context = await open_context(p, headless=headless)
         page = context.pages[0] if context.pages else await context.new_page()

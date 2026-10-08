@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from typing import Any
 
@@ -17,6 +18,7 @@ from limsg_cli.agent_ux import (
     EXIT_AUTH,
     EXIT_NOT_FOUND,
     EXIT_OK,
+    EXIT_USAGE,
     agent_output_options,
     compact_rows,
     die,
@@ -33,6 +35,7 @@ from limsg_cli.activity import (
     fetch_export,
     parse_since,
 )
+from limsg_cli.boost import NotFound, fetch_boost_stats, fetch_boosts
 from limsg_cli.api import (
     attach_response_sniffer,
     get_messages,
@@ -65,7 +68,7 @@ def _need_session() -> None:
 async def _login_async() -> None:
     console.print(
         "Opening Chrome to LinkedIn Messaging. "
-        "Sign in on Codefi if prompted; waiting for the messaging UI…"
+        "Sign in on the M4 MacBook if prompted; waiting for the messaging UI…"
     )
     async with async_playwright() as p:
         context = await open_context(p, headless=False)
@@ -127,7 +130,7 @@ async def _with_messaging_page(headless: bool = True):
             die(
                 "LinkedIn session expired or not signed in.",
                 EXIT_AUTH,
-                hint="Kevin must sign in: limsg login (headful Chrome on Codefi).",
+                hint="Kevin must sign in: limsg login (headful Chrome on the M4 MacBook).",
             )
         try:
             ready = await page.locator(".msg-conversations-container, main").count()
@@ -476,15 +479,17 @@ ACTIVITY_COMPACT = {
 }
 
 
-def _run_activity(coro):
+def _run_activity(coro, *, auth_hint: str = "Run: limsg login"):
     try:
         return asyncio.run(coro)
     except AuthRequired as exc:
-        die(str(exc), EXIT_AUTH, hint="Run: limsg login")
+        die(str(exc), EXIT_AUTH, hint=auth_hint)
     except ProfileBusy as exc:
         die(str(exc), EXIT_API)
     except ValueError as exc:
         die(str(exc), EXIT_USAGE)
+    except NotFound as exc:
+        die(str(exc), EXIT_NOT_FOUND)
     except SystemExit:
         raise
     except Exception as exc:
@@ -627,6 +632,130 @@ def activity_export(limit, since, out_path, fmt, compact, select, quiet, as_csv)
                 click.echo(f"Wrote {out_path}", err=True)
         else:
             emit_json(payload)
+    raise SystemExit(EXIT_OK)
+
+
+BOOST_COMPACT = (
+    "contentUrn",
+    "campaignId",
+    "status",
+    "spend",
+    "totalBudget",
+    "currency",
+    "impressions",
+    "clicks",
+    "landingPageClicks",
+    "ctr",
+    "cpc",
+)
+BOOST_TABLE = (
+    "contentUrn",
+    "status",
+    "spend/budget",
+    "impressions",
+    "clicks",
+    "landingPageClicks",
+    "ctr",
+    "cpc",
+    "startAt",
+    "endAt",
+)
+BOOST_AUTH_HINT = (
+    "Run: limsg login  (then open https://www.linkedin.com/campaignmanager/accounts once in that Chrome "
+    "if Campaign Manager asks for anything)"
+)
+
+
+def _boost_window(since: str | None, until: str | None):
+    try:
+        since_dt = parse_since(since)
+        until_dt = parse_since(until, flag="--until")
+    except ValueError as exc:
+        die(str(exc), EXIT_USAGE)
+    if since_dt and until_dt and since_dt.date() > until_dt.date():
+        die("--since is after --until.", EXIT_USAGE)
+    return since_dt, until_dt
+
+
+def _dash(value: Any) -> str:
+    return "—" if value is None else str(value)
+
+
+def _boost_cell(row: dict, col: str) -> str:
+    if col == "contentUrn":
+        return (row.get("contentUrn") or "—").removeprefix("urn:li:")
+    if col == "spend/budget":
+        return f"{_dash(row.get('spend'))}/{_dash(row.get('totalBudget'))} {row.get('currency') or ''}".strip()
+    if col == "ctr" and row.get("ctr") is not None:
+        return f"{row['ctr']}%"
+    return _dash(row.get(col))
+
+
+def _csv_cells(rows: list[dict]) -> list[dict]:
+    return [
+        {k: json.dumps(v) if isinstance(v, (list, dict)) else v for k, v in row.items()}
+        for row in rows
+    ]
+
+
+def _emit_boosts(rows: list[dict], *, single: bool, fmt, compact, select, quiet, as_csv) -> None:
+    data: Any = compact_rows(rows, BOOST_COMPACT) if compact else rows
+    data = select_fields(data, select)
+    if as_csv:
+        emit_csv(_csv_cells(data))
+        return
+    if resolve_format(fmt) == "json":
+        emit_json(data[0] if single else data)
+    elif single:
+        table = Table(title="LinkedIn Boost stats")
+        table.add_column("field")
+        table.add_column("value")
+        for key, value in data[0].items():
+            table.add_row(key, json.dumps(value) if isinstance(value, (list, dict)) else _dash(value))
+        Console().print(table)
+    else:
+        table = Table(title="LinkedIn Boosts")
+        for col in BOOST_TABLE:
+            table.add_column(col)
+        for row in rows:
+            table.add_row(*[_boost_cell(row, col) for col in BOOST_TABLE])
+        Console().print(table)
+    if not single:
+        note_showing(len(rows), quiet=quiet, noun="boosts")
+
+
+@main.group("boost")
+def boost_group() -> None:
+    """Read-only LinkedIn Boost (sponsored post) stats from Campaign Manager."""
+
+
+def _boost_window_options(fn):
+    fn = click.option("--until", default=None, help="Analytics end, ISO date or datetime (inclusive day, UTC).")(fn)
+    fn = click.option("--since", default=None, help="Analytics start, ISO date or datetime (UTC).")(fn)
+    return fn
+
+
+@boost_group.command("list")
+@_boost_window_options
+@click.option("--account", default=None, type=int, help="Only this Boost ad account id.")
+@agent_output_options(formats=("table", "json"))
+def boost_list(since, until, account, fmt, compact, select, quiet, as_csv) -> None:
+    """Every boosted campaign across your personal Boost ad accounts (READ-ONLY)."""
+    since_dt, until_dt = _boost_window(since, until)
+    rows = _run_activity(fetch_boosts(since_dt, until_dt, account=account), auth_hint=BOOST_AUTH_HINT)
+    _emit_boosts(rows, single=False, fmt=fmt, compact=compact, select=select, quiet=quiet, as_csv=as_csv)
+    raise SystemExit(EXIT_OK)
+
+
+@boost_group.command("stats")
+@click.argument("target")
+@_boost_window_options
+@agent_output_options(formats=("table", "json"))
+def boost_stats(target, since, until, fmt, compact, select, quiet, as_csv) -> None:
+    """Stats for one boost: urn:li:share:…, urn:li:activity:…, or a campaign id (READ-ONLY)."""
+    since_dt, until_dt = _boost_window(since, until)
+    row = _run_activity(fetch_boost_stats(target, since_dt, until_dt), auth_hint=BOOST_AUTH_HINT)
+    _emit_boosts([row], single=True, fmt=fmt, compact=compact, select=select, quiet=quiet, as_csv=as_csv)
     raise SystemExit(EXIT_OK)
 
 
