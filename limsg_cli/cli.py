@@ -14,6 +14,7 @@ from rich.table import Table
 
 from limsg_cli import __version__
 from limsg_cli.agent_ux import (
+    AGENT_HELP,
     EXIT_API,
     EXIT_AUTH,
     EXIT_NOT_FOUND,
@@ -27,6 +28,7 @@ from limsg_cli.agent_ux import (
     note_showing,
     resolve_format,
     select_fields,
+    wants_json,
 )
 from limsg_cli.activity import (
     AuthRequired,
@@ -36,6 +38,7 @@ from limsg_cli.activity import (
     parse_since,
 )
 from limsg_cli.boost import NotFound, fetch_boost_stats, fetch_boosts
+from limsg_cli.post import MAX_TEXT, create_post, load_image, load_text
 from limsg_cli.api import (
     attach_response_sniffer,
     get_messages,
@@ -757,6 +760,68 @@ def boost_stats(target, since, until, fmt, compact, select, quiet, as_csv) -> No
     row = _run_activity(fetch_boost_stats(target, since_dt, until_dt), auth_hint=BOOST_AUTH_HINT)
     _emit_boosts([row], single=True, fmt=fmt, compact=compact, select=select, quiet=quiet, as_csv=as_csv)
     raise SystemExit(EXIT_OK)
+
+
+@main.group("post")
+def post_group() -> None:
+    """Publish a LinkedIn post (text + one image). Dry-run unless --confirm."""
+
+
+def _emit_post(out: dict, fmt: str | None) -> None:
+    if out["dryRun"]:
+        click.echo("DRY-RUN: nothing was posted. Re-run with --confirm (and without --dry-run) to publish.", err=True)
+    else:
+        click.echo("POSTED", err=True)
+    if out.get("warning"):
+        click.echo(f"WARNING: {out['warning']}", err=True)
+    if wants_json(fmt):
+        emit_json(out)
+        return
+    author, image = out["author"], out["image"]
+    dims = f"  {image['width']}x{image['height']}" if image.get("width") else ""
+    lines = [] if out["dryRun"] else [f"URN:    {out['urn'] or '(unknown)'}", f"URL:    {out['url'] or '(unknown)'}"]
+    lines += [
+        f"Author: {author['name']} ({author['publicIdentifier']})  {author['profileUrn'] or ''}".rstrip(),
+        f"Image:  {image['path']}  {image['type']}  {image['bytes']:,} bytes{dims}",
+        f"Text ({out['textLength']} chars):",
+        out["text"],
+    ]
+    click.echo("\n".join(lines))
+
+
+@post_group.command("create")
+@click.option("--text", default=None, help=f"Post text (max {MAX_TEXT} characters).")
+@click.option("--text-file", default=None, type=click.Path(dir_okay=False), help="Read post text from a UTF-8 file.")
+@click.option("--image", required=True, type=click.Path(dir_okay=False), help="One JPEG, PNG, or GIF, max 10 MB.")
+@click.option("--dry-run", is_flag=True, help="Preview only (the default). Wins over --confirm.")
+@click.option("--confirm", is_flag=True, help="Actually publish. Without it, nothing is uploaded or posted.")
+@click.option(
+    "--format",
+    "fmt",
+    type=click.Choice(["json", "text"]),
+    default=None,
+    help="Output format. Default: text on a TTY, json when piped.",
+)
+def post_create(text, text_file, image, dry_run, confirm, fmt) -> None:
+    """Post text + one image to your feed. DRY-RUN unless --confirm (and no --dry-run)."""
+    try:
+        body = load_text(text, text_file)
+        img = load_image(image)
+    except ValueError as exc:
+        die(str(exc), EXIT_USAGE)
+    out = _run_activity(create_post(body, img, publish_now=confirm and not dry_run))
+    _emit_post(out, fmt)
+    raise SystemExit(EXIT_OK)
+
+
+@main.command("agent-help")
+@click.argument("command", nargs=-1)
+def agent_help(command: tuple[str, ...]) -> None:
+    """Usage notes for agents, e.g. `limsg agent-help post create`."""
+    key = " ".join(command)
+    if key and key not in AGENT_HELP:
+        die(f"No agent help for {key!r}. Topics: {', '.join(AGENT_HELP)}", EXIT_NOT_FOUND)
+    click.echo("\n".join(text for name, text in AGENT_HELP.items() if not key or name == key))
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@
 
 Unofficial **agent-native** CLI for LinkedIn messaging. There is no public LinkedIn Messages API; this tool uses a persistent Chrome profile (Playwright `channel=chrome`) the same way [google-keep-cli](../google-keep-cli) and google-gmail-cli do.
 
-**Not affiliated with LinkedIn.** Use only on accounts you control. Prefer dry-run for send.
+**Not affiliated with LinkedIn.** Use only on accounts you control. Prefer dry-run for send and post.
 
 ## Install (M4 MacBook)
 
@@ -52,6 +52,9 @@ Never commit `chrome-profile/` or `capture/`. Never paste cookies or tokens into
 | `limsg activity export [--format json\|csv] [--out PATH] [--since ISO] [--limit N]` | Comments + reactions + posts in one JSON object, or CSV with a `kind` column |
 | `limsg boost list [--since DATE] [--until DATE] [--account ID]` | Every boosted campaign across your personal Boost ad accounts (READ-ONLY) |
 | `limsg boost stats <share-urn\|activity-urn\|campaign-id> [--since DATE] [--until DATE]` | Spend, impressions, clicks, CTR, and review status for one boost (READ-ONLY) |
+| `limsg post create --text "…" \| --text-file PATH --image PATH` | Text + one image post. **Dry-run by default** |
+| `limsg post create … --confirm` | Actually publish (`--dry-run` still wins) |
+| `limsg agent-help [COMMAND]` | Usage notes written for agents (e.g. `limsg agent-help post create`) |
 
 ### Agent UX
 
@@ -177,6 +180,28 @@ Engagement metrics are paid (sponsored) engagement as reported by Campaign Manag
 
 If the session is missing or Campaign Manager wants sign-in, `boost` exits `4`. Run `limsg login`, then open https://www.linkedin.com/campaignmanager/accounts once in that Chrome if Campaign Manager asks for anything.
 
+### Post with an image (dry-run by default)
+
+`post create` publishes one post, text plus exactly one image, as the signed-in personal account.
+
+```bash
+limsg post create --text "Shipping today." --image card.png              # dry-run: prints what would post
+limsg post create --text-file post.txt --image card.jpg --format json    # dry-run, JSON
+limsg post create --text-file post.txt --image card.jpg --confirm        # publishes for real
+```
+
+- **Without `--confirm` nothing is uploaded or posted.** A dry-run validates the inputs, checks the session is logged in (one read: `GET /voyager/api/me`), and prints the author, the full text, and the image path, type, size, and dimensions. `--dry-run --confirm` is still a dry-run.
+- `--text` and `--text-file` (UTF-8) are mutually exclusive; one is required. Text is trimmed and must be non-empty and at most 3000 characters, counted like LinkedIn's composer (UTF-16 units, so an emoji counts 2). Hashtags and @names go out as plain text, not links.
+- `--image` must be JPEG, PNG, or GIF, judged by the file's magic bytes rather than its extension, and at most 10 MB. LinkedIn accepts larger images; 10 MB keeps the single in-page upload small.
+- Output is JSON when piped or with `--format json`, text on a TTY or with `--format text`. Dry-run fields: `dryRun`, `loggedIn`, `author` (`name`, `publicIdentifier`, `profileUrn`, `memberUrn`), `text`, `textLength`, `image` (`path`, `filename`, `type`, `bytes`, `width`, `height`). `--confirm` adds `posted`, `urn`, `url` (`https://www.linkedin.com/feed/update/<urn>/`), and `image.assetUrn`.
+- Exit codes: `2` bad input (checked before Chrome opens), `4` not logged in, `5` API error or Chrome profile busy.
+
+If `--confirm` fails, the message says whether anything can be live:
+
+- Register or upload failed, or LinkedIn rejected the create with a 4xx: nothing was posted.
+- Create got a 5xx or no response: the post **may be live**. Check your profile before retrying.
+- Create returned 2xx but no post URN: the post is live. The command exits `0` with `urn: null` and a `warning`. Do not re-run it, or it will post twice.
+
 ## How it talks to LinkedIn
 
 Prefer replaying Voyager / Messaging GraphQL with the page’s own cookies (no cookie printing):
@@ -196,6 +221,13 @@ Prefer replaying Voyager / Messaging GraphQL with the page’s own cookies (no c
   - `GET campaignManagerReportingCreatives?accountId={acct}&q=cursorBasedCriteria&campaignIds=List({id})&count=10`
   - `GET campaignManagerAdAnalytics?q=statistics&pivots=List(CAMPAIGN)&timeGranularity=ALL&dateRange=(…)&campaignIds=List({id})&fields=…` (the field list is fixed; an unknown field name returns HTTP 500)
 
+- Post (from `https://www.linkedin.com/robots.txt`, same origin, no app JS). Dry-run makes only the first call:
+  - `GET /voyager/api/me` (login check + author)
+  - `POST /voyager/api/voyagerVideoDashMediaUploadMetadata?action=upload` with `{"mediaUploadType":"IMAGE_SHARING","fileSize":N,"filename":"…"}` → asset urn + `singleUploadUrl`
+  - `PUT {singleUploadUrl}` (image bytes; must be an `https://*.linkedin.com` URL)
+  - `POST /voyager/api/contentcreation/normShares` with `commentaryV2` and `media: [{"category":"IMAGE","mediaUrn":…}]` → post urn from `data.status.urn`, else the `x-restli-id` header
+  - These shapes match OSS Voyager clients (gabros20/linkedin-relay reports `normShares` returning 201 live on 2026-08-13). This repo has never run them live; only the dry-run has touched a real session.
+
 `/in/me/recent-activity/...` only identifies the vanity URL; the list itself renders on `/in/{vanity}/recent-activity/...`. `queryId` hashes for messaging rotate; login/list/activity sniff captures update `~/.linkedin-messages-cli/capture/`.
 
 ## Safety
@@ -204,6 +236,7 @@ Prefer replaying Voyager / Messaging GraphQL with the page’s own cookies (no c
 - **`history` / `read` are READ-ONLY** (GET only). They never call `createMessage`.
 - **`activity` is READ-ONLY.** `comments`, `reactions`, `posts`, and `export` only open Recent activity and read it. They do not post, react, comment, or send DMs, and they never call `createMessage`.
 - **`boost` is READ-ONLY:** GET only against campaign-manager-api; never edits, pauses, resumes, deletes, or changes budgets; never opens Campaign Manager UI pages. It never calls `?action=` endpoints such as `fetchCurrentRunningSpend` or `billingConfiguration`.
+- **`post create` never posts without `--confirm`**, and `--dry-run` overrides `--confirm`. Writes run once each: no retries, no redirects followed.
 - Do not blast Boardy or anyone. Prefer `messages list` / `messages history` for smoke tests; dry-run send only on throwaway threads.
 
 ## License
