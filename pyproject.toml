@@ -1,6 +1,6 @@
 [project]
 name = "linkedin-messages-cli"
-version = "0.3.0"
+version = "0.3.1"
 description = "Unofficial agent-native CLI for LinkedIn messaging, read-only activity export, and read-only Boost stats (Chrome session)."
 readme = "README.md"
 license = "MIT"

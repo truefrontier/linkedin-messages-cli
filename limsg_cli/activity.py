@@ -15,14 +15,17 @@ createMessage.
 
 from __future__ import annotations
 
+import os
 import re
+import socket
 import subprocess
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin
 
 from limsg_cli.api import attach_response_sniffer
-from limsg_cli.browser import has_session, open_context
+from limsg_cli.browser import PROFILE, has_session, open_context
 from limsg_cli.capture import save_capture
 
 ME_ACTIVITY = "https://www.linkedin.com/in/me/recent-activity/comments/"
@@ -80,17 +83,80 @@ class ProfileBusy(RuntimeError):
     pass
 
 
+# argv[0] of a Chrome/Chromium process: a macOS app bundle (main or helper),
+# or a Linux binary. Anchored so a prompt that merely mentions Chrome does not count.
+# ponytail: misses bundles under a parent dir with spaces; SingletonLock still catches those.
+_CHROME_EXE = re.compile(
+    r"^(?:/[^/\s]+)*/(?:Google Chrome|Chromium)[^/]*\.app/Contents/"
+    r"|^(?:\S*/)?(?:google-chrome[\w-]*|chrome|chromium[\w-]*)(?:\s|$)",
+    re.I,
+)
+_USER_DATA_DIR = re.compile(r"\s--user-data-dir=(.+?)(?=\s--|$)")
+_SINGLETONS = ("SingletonLock", "SingletonSocket", "SingletonCookie")
+
+
+def _ps(*args: str) -> list[str]:
+    proc = subprocess.run(["ps", *args, "-o", "pid=,command="], capture_output=True, text=True, check=False)
+    return (proc.stdout or "").splitlines()
+
+
+def _profile_chrome_pids(lines: list[str]) -> list[int]:
+    """Pids of ps rows whose command is Chrome with --user-data-dir=PROFILE."""
+    profile = PROFILE.resolve()
+    pids = []
+    for line in lines:
+        pid, _, command = line.strip().partition(" ")
+        command = command.strip()
+        if not pid.isdigit() or int(pid) == os.getpid() or not _CHROME_EXE.match(command):
+            continue
+        m = _USER_DATA_DIR.search(command)
+        # The value may hold spaces or be followed by a URL, so try each space-split prefix.
+        words = m.group(1).split(" ") if m else []
+        if any(Path(" ".join(words[:i])).expanduser().resolve() == profile for i in range(1, len(words) + 1)):
+            pids.append(int(pid))
+    return pids
+
+
+def _chrome_using_profile() -> int | None:
+    """Pid of a running Chrome launched with --user-data-dir=PROFILE, if any."""
+    for pid in _profile_chrome_pids(_ps("-axww")):
+        # ps prints multi-line argv (agent prompts) raw, so a prompt line can pose
+        # as a Chrome row. Only the first line of the pid's own row is its real argv.
+        if _profile_chrome_pids(_ps("-ww", "-p", str(pid))[:1]) == [pid]:
+            return pid
+    return None
+
+
+def _singleton_lock_pid() -> int | None:
+    """Pid holding PROFILE/SingletonLock if alive; clears the lock if its Chrome is dead."""
+    try:
+        target = os.readlink(PROFILE / "SingletonLock")  # "<hostname>-<pid>"
+    except OSError:
+        return None
+    host, _, pid = target.rpartition("-")
+    if host != socket.gethostname() or not pid.isdigit():
+        return None
+    # ponytail: a stale lock whose pid was reused counts as busy; check the pid is Chrome if that bites.
+    try:
+        os.kill(int(pid), 0)
+        return int(pid)
+    except PermissionError:
+        return int(pid)
+    except ProcessLookupError:
+        pass
+    for name in _SINGLETONS:
+        try:
+            os.unlink(PROFILE / name)
+        except FileNotFoundError:
+            pass
+    return None
+
+
 def assert_profile_idle() -> None:
-    proc = subprocess.run(
-        ["pgrep", "-lf", "-i", "chrome.*linkedin-messages-cli"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    lines = [ln for ln in (proc.stdout or "").splitlines() if ln.strip() and "pgrep" not in ln]
-    if lines:
+    pid = _chrome_using_profile() or _singleton_lock_pid()
+    if pid:
         raise ProfileBusy(
-            "Chrome is already using ~/.linkedin-messages-cli/chrome-profile/. Close it and retry."
+            f"Chrome is already using ~/.linkedin-messages-cli/chrome-profile/ (pid {pid}). Close it and retry."
         )
 
 
