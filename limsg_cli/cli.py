@@ -38,7 +38,15 @@ from limsg_cli.activity import (
     parse_since,
 )
 from limsg_cli.boost import NotFound, fetch_boost_stats, fetch_boosts
-from limsg_cli.post import MAX_TEXT, create_post, load_image, load_text
+from limsg_cli.post import (
+    EXPECT_AUTHOR_ENV,
+    MAX_TEXT,
+    create_post,
+    load_image,
+    load_text,
+    mismatch_message,
+    resolve_expect_author,
+)
 from limsg_cli.api import (
     attach_response_sniffer,
     get_messages,
@@ -770,8 +778,14 @@ def post_group() -> None:
 def _emit_post(out: dict, fmt: str | None) -> None:
     if out["dryRun"]:
         click.echo("DRY-RUN: nothing was posted. Re-run with --confirm (and without --dry-run) to publish.", err=True)
-    else:
+    elif out["posted"]:
         click.echo("POSTED", err=True)
+    if not out["authorMatches"]:
+        mismatch = mismatch_message(out["author"], out["expectedAuthor"])
+        if out["dryRun"]:
+            click.echo(f"WARNING: AUTHOR MISMATCH. {mismatch} --confirm will refuse to post.", err=True)
+        else:
+            click.echo(f"REFUSED: {mismatch} Nothing was uploaded or posted.", err=True)
     if out.get("warning"):
         click.echo(f"WARNING: {out['warning']}", err=True)
     if wants_json(fmt):
@@ -779,9 +793,11 @@ def _emit_post(out: dict, fmt: str | None) -> None:
         return
     author, image = out["author"], out["image"]
     dims = f"  {image['width']}x{image['height']}" if image.get("width") else ""
-    lines = [] if out["dryRun"] else [f"URN:    {out['urn'] or '(unknown)'}", f"URL:    {out['url'] or '(unknown)'}"]
+    lines = [f"URN:    {out['urn'] or '(unknown)'}", f"URL:    {out['url'] or '(unknown)'}"] if out.get("posted") else []
+    ids = "  ".join(u for u in (author["profileUrn"], author["memberUrn"]) if u)
     lines += [
-        f"Author: {author['name']} ({author['publicIdentifier']})  {author['profileUrn'] or ''}".rstrip(),
+        f"Author: {author['name']} ({author['publicIdentifier']})  {ids}".rstrip(),
+        f"Expect: {out['expectedAuthor']}  {'MATCH' if out['authorMatches'] else 'MISMATCH'}",
         f"Image:  {image['path']}  {image['type']}  {image['bytes']:,} bytes{dims}",
         f"Text ({out['textLength']} chars):",
         out["text"],
@@ -796,22 +812,30 @@ def _emit_post(out: dict, fmt: str | None) -> None:
 @click.option("--dry-run", is_flag=True, help="Preview only (the default). Wins over --confirm.")
 @click.option("--confirm", is_flag=True, help="Actually publish. Without it, nothing is uploaded or posted.")
 @click.option(
+    "--expect-author",
+    default=None,
+    metavar="HANDLE",
+    help=f"Only post if signed in as this handle (linkedin.com/in/HANDLE). Default: ${EXPECT_AUTHOR_ENV}, "
+    "then expect_author in ~/.linkedin-messages-cli/config.toml or config.json, then kevnk.",
+)
+@click.option(
     "--format",
     "fmt",
     type=click.Choice(["json", "text"]),
     default=None,
     help="Output format. Default: text on a TTY, json when piped.",
 )
-def post_create(text, text_file, image, dry_run, confirm, fmt) -> None:
+def post_create(text, text_file, image, dry_run, confirm, expect_author, fmt) -> None:
     """Post text + one image to your feed. DRY-RUN unless --confirm (and no --dry-run)."""
     try:
         body = load_text(text, text_file)
         img = load_image(image)
+        expected = resolve_expect_author(expect_author)
     except ValueError as exc:
         die(str(exc), EXIT_USAGE)
-    out = _run_activity(create_post(body, img, publish_now=confirm and not dry_run))
+    out = _run_activity(create_post(body, img, publish_now=confirm and not dry_run, expect_author=expected))
     _emit_post(out, fmt)
-    raise SystemExit(EXIT_OK)
+    raise SystemExit(EXIT_OK if out["authorMatches"] else EXIT_AUTH)
 
 
 @main.command("agent-help")

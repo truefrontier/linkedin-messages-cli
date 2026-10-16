@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import re
 import struct
 import sys
 import threading
@@ -33,6 +34,7 @@ UPLOAD = "https://www.linkedin.com/dms-uploads/sp/v2/D4E10AQ_fake/uploaded-image
 CREATE = "https://www.linkedin.com/voyager/api/contentcreation/normShares"
 ASSET = "urn:li:digitalmediaAsset:D4E10AQ_fake"
 SHARE = "urn:li:share:7384000000000000001"
+REAL_CONFIG_FILES = post.CONFIG_FILES  # before the autouse fixture swaps in tmp paths
 
 
 def resp(status: int, body=None, restli_id=None) -> dict:
@@ -40,21 +42,50 @@ def resp(status: int, body=None, restli_id=None) -> dict:
     return {"status": status, "json": body, "text": "" if body is None else json.dumps(body), "restliId": restli_id}
 
 
+MINI = "com.linkedin.voyager.identity.shared.MiniProfile"
+TEST_PROFILE = {
+    "$type": MINI,
+    "entityUrn": "urn:li:fs_miniProfile:ACoAAFake",
+    "dashEntityUrn": "urn:li:fsd_profile:ACoAAFake",
+    "objectUrn": "urn:li:member:4242",
+    "firstName": "Test",
+    "lastName": "Author",
+    "publicIdentifier": "test-author",
+}
+# The real incident: two accounts named Kevin Kirchner. kevnk is the one posts must come from.
+KEVNK = {
+    "$type": MINI,
+    "entityUrn": "urn:li:fs_miniProfile:ACoAAAIJK2MBOkk_kX24uyFpDexBxwtR6BXzBqw",
+    "dashEntityUrn": "urn:li:fsd_profile:ACoAAAIJK2MBOkk_kX24uyFpDexBxwtR6BXzBqw",
+    "objectUrn": "urn:li:member:34155363",
+    "firstName": "Kevin",
+    "lastName": "Kirchner",
+    "publicIdentifier": "kevnk",
+}
+OTHER = {
+    "$type": MINI,
+    "entityUrn": "urn:li:fs_miniProfile:ACoAAOtherKevin",
+    "dashEntityUrn": "urn:li:fsd_profile:ACoAAOtherKevin",
+    "objectUrn": "urn:li:member:999",
+    "firstName": "Kevin",
+    "lastName": "Kirchner",
+    "publicIdentifier": "kevin-kirchner-817709300",
+}
+
+
+def me_as(profile: dict, *others: dict) -> dict:
+    """GET /me signed in as `profile`, with `others` listed first in included."""
+    return resp(
+        200,
+        {"data": {"*miniProfile": profile["entityUrn"], "$type": "com.linkedin.voyager.common.Me"}, "included": [*others, profile]},
+    )
+
+
 ME_OK = resp(
     200,
     {
         "data": {"plainId": 4242, "*miniProfile": "urn:li:fs_miniProfile:ACoAAFake", "$type": "com.linkedin.voyager.common.Me"},
-        "included": [
-            {
-                "$type": "com.linkedin.voyager.identity.shared.MiniProfile",
-                "entityUrn": "urn:li:fs_miniProfile:ACoAAFake",
-                "dashEntityUrn": "urn:li:fsd_profile:ACoAAFake",
-                "objectUrn": "urn:li:member:4242",
-                "firstName": "Test",
-                "lastName": "Author",
-                "publicIdentifier": "test-author",
-            }
-        ],
+        "included": [TEST_PROFILE],
     },
 )
 AUTHOR = {
@@ -84,10 +115,21 @@ CREATE_OK = resp(
     {"data": {"status": {"urn": SHARE, "toastCtaText": "View post"}}, "included": [{"urn": "urn:li:activity:7384000000000000009"}]},
 )
 ALL_OK = {("GET", ME): ME_OK, ("POST", REGISTER): REGISTER_OK, ("PUT", UPLOAD): UPLOAD_OK, ("POST", CREATE): CREATE_OK}
+PUBLISH_CALLS = [("GET", ME), ("POST", REGISTER), ("PUT", UPLOAD), ("GET", ME), ("POST", CREATE)]
+
+
+@pytest.fixture(autouse=True)
+def author_config(monkeypatch, tmp_path):
+    """Never read the real ~/.linkedin-messages-cli config. Expect the fixture author unless a test says otherwise."""
+    monkeypatch.setattr(post, "CONFIG_FILES", (tmp_path / "config.toml", tmp_path / "config.json"))
+    monkeypatch.setenv(post.EXPECT_AUTHOR_ENV, "test-author")
 
 
 class FakePage:
-    """Answers page.evaluate by (method, url) and records every call. Unknown calls fail the test."""
+    """Answers page.evaluate by (method, url) and records every call. Unknown calls fail the test.
+
+    A list answers successive calls in order.
+    """
 
     def __init__(self, responses: dict, cookies: list[dict] | None = None):
         self.responses = responses
@@ -102,9 +144,12 @@ class FakePage:
         self.calls.append(arg)
         key = (arg["method"], arg["url"])
         assert key in self.responses, f"unexpected network call {key}"
-        if isinstance(self.responses[key], Exception):
-            raise self.responses[key]
-        return self.responses[key]
+        answer = self.responses[key]
+        if isinstance(answer, list):
+            answer = answer.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
 
     def methods_urls(self):
         return [(c["method"], c["url"]) for c in self.calls]
@@ -127,8 +172,9 @@ def png(tmp_path):
     return path
 
 
-def run(page, text, image_path, *, publish_now):
-    return asyncio.run(post.run(page, text, post.load_image(str(image_path)), publish_now=publish_now))
+def run(page, text, image_path, *, publish_now, expect_author="test-author"):
+    image = post.load_image(str(image_path))
+    return asyncio.run(post.run(page, text, image, publish_now=publish_now, expect_author=expect_author))
 
 
 # ---------------------------------------------------------------- dry-run makes no writes
@@ -144,6 +190,8 @@ def test_dry_run_only_reads_me(png):
         "dryRun": True,
         "loggedIn": True,
         "author": AUTHOR,
+        "expectedAuthor": "test-author",
+        "authorMatches": True,
         "text": "Hello feed",
         "textLength": 10,
         "image": {
@@ -177,8 +225,8 @@ def test_confirm_registers_uploads_creates_in_order(png):
 
     out = run(page, "Launch day.\n\nDetails below.", png, publish_now=True)
 
-    assert page.methods_urls() == [("GET", ME), ("POST", REGISTER), ("PUT", UPLOAD), ("POST", CREATE)]
-    register, upload, create = page.calls[1:]
+    assert page.methods_urls() == PUBLISH_CALLS
+    register, upload, _, create = page.calls[1:]
     assert register["json"] == {"mediaUploadType": "IMAGE_SHARING", "fileSize": len(png_bytes()), "filename": "card.png"}
     assert register["headers"]["csrf-token"] == "ajax:0000"
     assert register["headers"]["content-type"] == "application/json"
@@ -200,6 +248,7 @@ def test_confirm_registers_uploads_creates_in_order(png):
     assert out["url"] == "https://www.linkedin.com/feed/update/urn:li:share:7384000000000000001/"
     assert out["image"]["assetUrn"] == ASSET
     assert out["author"] == AUTHOR
+    assert out["expectedAuthor"] == "test-author" and out["authorMatches"] is True
     assert "warning" not in out
 
 
@@ -264,8 +313,16 @@ def test_create_urn_from_restli_id_header_when_body_is_empty(png):
     assert "warning" not in out
 
 
-def test_create_2xx_without_urn_reports_posted_with_warning(png):
-    page = FakePage({**ALL_OK, ("POST", CREATE): resp(201)})
+@pytest.mark.parametrize(
+    "create",
+    [
+        resp(201),
+        # A post urn elsewhere in the body may be another post, even someone else's: not ours.
+        resp(201, {"data": {}, "included": [{"entityUrn": "urn:li:share:999", "urn": "urn:li:activity:998"}]}),
+    ],
+)
+def test_create_2xx_without_urn_reports_posted_with_warning(png, create):
+    page = FakePage({**ALL_OK, ("POST", CREATE): create})
 
     out = run(page, "Hello", png, publish_now=True)
 
@@ -287,14 +344,143 @@ def test_cli_2xx_without_urn_exits_0_and_warns(monkeypatch, png):
 
 
 def test_created_urn_parsing():
-    assert post.parse_created_urn({"value": {"urn": "urn:li:ugcPost:12"}}, "") == "urn:li:ugcPost:12"
-    assert post.parse_created_urn({"data": {"x": 1}, "included": [{"urn": "urn:li:activity:99"}]}, "") == "urn:li:activity:99"
-    assert post.parse_created_urn({"data": {}}, "") is None
-    # A urn inside the echoed post text is not the new post.
-    text = 'Re: "urn:li:share:111"'
-    echoed = {"included": [{"commentary": {"text": text}}, {"entityUrn": "urn:li:share:222"}]}
-    assert post.parse_created_urn(echoed, text) == "urn:li:share:222"
-    assert post.parse_created_urn({"included": [{"commentary": {"text": text}}]}, text) is None
+    assert post.parse_created_urn({"data": {"status": {"urn": SHARE}}}) == SHARE
+    assert post.parse_created_urn({"value": {"urn": "urn:li:ugcPost:12"}}) == "urn:li:ugcPost:12"
+    assert post.parse_created_urn({"data": {}}, "urn%3Ali%3Ashare%3A42") == "urn:li:share:42"
+    assert post.parse_created_urn({"data": {}}) is None
+    assert post.parse_created_urn(None, "not-a-urn") is None
+    # Post urns elsewhere in the body (included items, echoed text) are never reported as the new post.
+    assert post.parse_created_urn({"data": {"x": 1}, "included": [{"urn": "urn:li:activity:99"}]}) is None
+    assert post.parse_created_urn({"included": [{"commentary": {"text": "urn:li:share:111"}}, {"entityUrn": "urn:li:share:222"}]}) is None
+
+
+# ---------------------------------------------------------------- author identity
+
+
+def test_parse_me_takes_the_profile_mini_profile_points_at_not_the_first_included():
+    body = {"data": {"plainId": 34155363, "*miniProfile": KEVNK["entityUrn"]}, "included": [OTHER, KEVNK]}
+
+    assert post.parse_me(body) == {
+        "name": "Kevin Kirchner",
+        "publicIdentifier": "kevnk",
+        "profileUrn": "urn:li:fsd_profile:ACoAAAIJK2MBOkk_kX24uyFpDexBxwtR6BXzBqw",
+        "memberUrn": "urn:li:member:34155363",
+    }
+    body["data"]["*miniProfile"] = OTHER["entityUrn"]
+    body["included"] = [KEVNK, OTHER]
+    assert post.parse_me(body)["publicIdentifier"] == "kevin-kirchner-817709300"
+
+
+@pytest.mark.parametrize(
+    "body, handle",
+    [
+        ({"miniProfile": KEVNK, "plainId": 34155363}, "kevnk"),  # not normalized: profile inline
+        ({"data": {"miniProfile": {"entityUrn": KEVNK["entityUrn"]}}, "included": [OTHER, KEVNK]}, "kevnk"),
+        ({"data": {"*miniProfile": KEVNK["dashEntityUrn"]}, "included": [OTHER, KEVNK]}, "kevnk"),
+        ({"data": {}, "included": [{"$type": "x"}, KEVNK]}, "kevnk"),  # no pointer, one profile
+        ({"data": {}, "included": [OTHER, KEVNK]}, None),  # no pointer, two profiles
+        ({"data": {"*miniProfile": "urn:li:fs_miniProfile:ACoAAGone"}, "included": [OTHER]}, None),
+        ({"data": {"*miniProfile": KEVNK["entityUrn"]}, "included": [OTHER]}, None),
+        ({"data": {"*miniProfile": KEVNK["entityUrn"]}, "included": [KEVNK, dict(KEVNK)]}, None),  # pointer matches two
+        ({"data": {}, "included": []}, None),
+        ({"data": {}, "included": [{"publicIdentifier": "kevnk"}]}, None),  # no urns to re-check against
+        ({"data": {}, "included": [{**KEVNK, "objectUrn": None}]}, None),  # no member urn, no plainId
+        ({"data": {"plainId": 34155363}, "included": [{**KEVNK, "objectUrn": None}]}, "kevnk"),  # plainId fills it
+    ],
+)
+def test_parse_me_needs_one_unambiguous_profile(body, handle):
+    author = post.parse_me(body)
+
+    assert (author["publicIdentifier"] if author else None) == handle
+
+
+def test_wrong_account_refuses_publish_with_zero_writes(png):
+    page = FakePage({**ALL_OK, ("GET", ME): me_as(OTHER, KEVNK)})  # old parse_me reported kevnk here
+
+    out = run(page, "Hello", png, publish_now=True, expect_author="kevnk")
+
+    assert page.methods_urls() == [("GET", ME)]
+    assert out["posted"] is False and out["authorMatches"] is False
+    assert out["expectedAuthor"] == "kevnk"
+    assert out["author"] == {
+        "name": "Kevin Kirchner",
+        "publicIdentifier": "kevin-kirchner-817709300",
+        "profileUrn": "urn:li:fsd_profile:ACoAAOtherKevin",
+        "memberUrn": "urn:li:member:999",
+    }
+    assert "urn" not in out and "assetUrn" not in out["image"]
+
+
+def test_matching_account_publishes_ignoring_handle_case(png):
+    page = FakePage({**ALL_OK, ("GET", ME): me_as(KEVNK, OTHER)})
+
+    out = run(page, "Hello", png, publish_now=True, expect_author="KevNK")
+
+    assert page.methods_urls() == PUBLISH_CALLS
+    assert out["posted"] is True and out["authorMatches"] is True and out["urn"] == SHARE
+    assert out["author"]["publicIdentifier"] == "kevnk"
+
+
+@pytest.mark.parametrize(
+    "second_me, message",
+    [
+        (me_as(OTHER), "changed from Test Author (test-author, urn:li:member:4242) to "
+                       "Kevin Kirchner (kevin-kirchner-817709300, urn:li:member:999)"),
+        (me_as({**TEST_PROFILE, "objectUrn": "urn:li:member:5"}), "changed from Test Author"),  # same handle, other member
+        (resp(200, {"data": {}, "included": [OTHER, KEVNK]}), "could not re-check the signed-in account"),
+        (resp(401, {}), "could not re-check the signed-in account"),
+        (RuntimeError("Target page, context or browser has been closed"), "could not re-check the signed-in account"),
+    ],
+)
+def test_author_recheck_before_create_refuses_if_account_changed(png, second_me, message):
+    page = FakePage({**ALL_OK, ("GET", ME): [ME_OK, second_me]})
+
+    with pytest.raises(post.AuthorRefused, match=re.escape(message) + ".*Nothing was posted"):
+        run(page, "Hello", png, publish_now=True)
+
+    assert page.methods_urls() == [("GET", ME), ("POST", REGISTER), ("PUT", UPLOAD), ("GET", ME)]
+
+
+def test_expected_author_resolution_order(monkeypatch):
+    home = Path.home() / ".linkedin-messages-cli"
+    assert REAL_CONFIG_FILES == (home / "config.toml", home / "config.json")
+    toml, js = post.CONFIG_FILES
+    monkeypatch.delenv(post.EXPECT_AUTHOR_ENV)
+
+    assert post.resolve_expect_author(None) == "kevnk"
+    js.write_text('{"expect_author": "from-json"}', encoding="utf-8")
+    assert post.resolve_expect_author(None) == "from-json"
+    toml.write_text('[other]\nexpect_author = "not-top-level"\n', encoding="utf-8")
+    assert post.resolve_expect_author(None) == "from-json"
+    toml.write_text('# mine\nexpect_author = "from-toml"  # handle\n', encoding="utf-8")
+    assert post.resolve_expect_author(None) == "from-toml"
+    monkeypatch.setenv(post.EXPECT_AUTHOR_ENV, "from-env")
+    assert post.resolve_expect_author(None) == "from-env"
+    assert post.resolve_expect_author(" From-Flag ") == "From-Flag"
+
+
+@pytest.mark.parametrize(
+    "flag, env, file, content, message",
+    [
+        ("", None, None, None, "Expected author must be a LinkedIn handle"),
+        (None, "  ", None, None, "Expected author must be a LinkedIn handle"),
+        (None, None, "config.json", '{"expect_author": 7}', "got 7"),
+        (None, None, "config.json", '{"expect_author": ""}', "got ''"),
+        (None, None, "config.json", "{not json", "Cannot read config"),
+        (None, None, "config.json", '["kevnk"]', "must be a JSON object"),
+        (None, None, "config.toml", "expect_author = kevnk", "Cannot read config"),
+        (None, None, "config.toml", 'expect_author = ""', "got ''"),
+    ],
+)
+def test_expected_author_errors(monkeypatch, tmp_path, flag, env, file, content, message):
+    monkeypatch.delenv(post.EXPECT_AUTHOR_ENV)
+    if env is not None:
+        monkeypatch.setenv(post.EXPECT_AUTHOR_ENV, env)
+    if file:
+        (tmp_path / file).write_text(content, encoding="utf-8")
+
+    with pytest.raises(ValueError, match=re.escape(message)):
+        post.resolve_expect_author(flag)
 
 
 # ---------------------------------------------------------------- validation
@@ -399,6 +585,7 @@ def test_cli_dry_run_is_default_and_wins_over_confirm(monkeypatch, png, flags):
     assert result.exit_code == 0, result.output
     assert "DRY-RUN: nothing was posted" in result.output
     assert data["dryRun"] is True and "urn" not in data
+    assert (data["author"], data["expectedAuthor"], data["authorMatches"]) == (AUTHOR, "test-author", True)
     assert page.methods_urls() == [("GET", ME)]
 
 
@@ -410,7 +597,8 @@ def test_cli_confirm_publishes_and_prints_urn_url(monkeypatch, png):
     assert result.exit_code == 0, result.output
     assert data["urn"] == SHARE
     assert data["url"] == f"https://www.linkedin.com/feed/update/{SHARE}/"
-    assert page.methods_urls() == [("GET", ME), ("POST", REGISTER), ("PUT", UPLOAD), ("POST", CREATE)]
+    assert (data["posted"], data["author"], data["expectedAuthor"], data["authorMatches"]) == (True, AUTHOR, "test-author", True)
+    assert page.methods_urls() == PUBLISH_CALLS
 
 
 def test_cli_text_format_shows_full_text_and_image(monkeypatch, png):
@@ -419,7 +607,8 @@ def test_cli_text_format_shows_full_text_and_image(monkeypatch, png):
     result, _ = cli("--text", "line one\nline two", "--image", str(png), "--format", "text")
 
     assert result.exit_code == 0, result.output
-    assert "Author: Test Author (test-author)  urn:li:fsd_profile:ACoAAFake" in result.output
+    assert "Author: Test Author (test-author)  urn:li:fsd_profile:ACoAAFake  urn:li:member:4242" in result.output
+    assert "Expect: test-author  MATCH" in result.output
     assert f"Image:  {png.resolve()}  image/png  {len(png_bytes()):,} bytes  1200x627" in result.output
     assert "Text (17 chars):\nline one\nline two" in result.output
 
@@ -432,6 +621,7 @@ def test_cli_text_format_shows_full_text_and_image(monkeypatch, png):
         (["--text", " ", "--image", "{png}"], "Post text is empty"),
         (["--text", "a", "--image", "/nope/missing.png"], "Image not found"),
         (["--text", "a"], "Missing option '--image'"),
+        (["--text", "a", "--image", "{png}", "--expect-author", " "], "Expected author must be a LinkedIn handle"),
     ],
 )
 def test_cli_validation_errors_exit_2_without_touching_linkedin(monkeypatch, png, args, message):
@@ -445,6 +635,79 @@ def test_cli_validation_errors_exit_2_without_touching_linkedin(monkeypatch, png
 
     assert result.exit_code == 2
     assert message in result.output
+
+
+def test_cli_bad_config_exits_2_without_touching_linkedin(monkeypatch, png):
+    monkeypatch.delenv(post.EXPECT_AUTHOR_ENV)
+    post.CONFIG_FILES[0].write_text("expect_author = \n", encoding="utf-8")
+    monkeypatch.setattr(post, "_session_page", lambda: pytest.fail("bad config must not open a session"))
+
+    result, _ = cli("--text", "hi", "--image", str(png), "--confirm")
+
+    assert result.exit_code == 2
+    assert "Cannot read config" in result.output
+
+
+def test_cli_dry_run_warns_loudly_on_author_mismatch_and_exits_4(monkeypatch, png):
+    monkeypatch.delenv(post.EXPECT_AUTHOR_ENV)  # built-in default: kevnk
+    page = fake_session(monkeypatch, FakePage(ALL_OK))
+
+    result, data = cli("--text", "hi", "--image", str(png), "--format", "json")
+
+    assert result.exit_code == 4
+    assert (
+        "WARNING: AUTHOR MISMATCH. Signed in as Test Author (test-author, urn:li:member:4242), "
+        "but the expected author is kevnk. Sign in as kevnk with `limsg login`. --confirm will refuse to post."
+    ) in result.output
+    assert data["dryRun"] is True
+    assert (data["author"], data["expectedAuthor"], data["authorMatches"]) == (AUTHOR, "kevnk", False)
+    assert page.methods_urls() == [("GET", ME)]
+
+
+@pytest.mark.parametrize("fmt", ["json", "text"])
+def test_cli_confirm_as_wrong_account_is_refused_with_zero_writes(monkeypatch, png, fmt):
+    monkeypatch.delenv(post.EXPECT_AUTHOR_ENV)
+    page = fake_session(monkeypatch, FakePage({**ALL_OK, ("GET", ME): me_as(OTHER, KEVNK)}))
+
+    result, data = cli("--text", "hi", "--image", str(png), "--confirm", "--format", fmt)
+
+    assert result.exit_code == 4
+    assert "REFUSED: Signed in as Kevin Kirchner (kevin-kirchner-817709300, urn:li:member:999)" in result.output
+    assert "Nothing was uploaded or posted" in result.output
+    assert "POSTED" not in result.output
+    assert page.methods_urls() == [("GET", ME)]
+    if fmt == "json":
+        assert (data["dryRun"], data["posted"], data["authorMatches"], data["expectedAuthor"]) == (False, False, False, "kevnk")
+        assert data["author"]["memberUrn"] == "urn:li:member:999"
+    else:
+        assert "Expect: kevnk  MISMATCH" in result.output and "URN:" not in result.output
+
+
+def test_cli_confirm_as_kevnk_publishes_with_default_expectation(monkeypatch, png):
+    monkeypatch.delenv(post.EXPECT_AUTHOR_ENV)
+    page = fake_session(monkeypatch, FakePage({**ALL_OK, ("GET", ME): me_as(KEVNK, OTHER)}))
+
+    result, data = cli("--text", "hi", "--image", str(png), "--confirm", "--format", "json")
+
+    assert result.exit_code == 0, result.output
+    assert (data["posted"], data["urn"], data["expectedAuthor"], data["authorMatches"]) == (True, SHARE, "kevnk", True)
+    assert data["author"] == {
+        "name": "Kevin Kirchner",
+        "publicIdentifier": "kevnk",
+        "profileUrn": "urn:li:fsd_profile:ACoAAAIJK2MBOkk_kX24uyFpDexBxwtR6BXzBqw",
+        "memberUrn": "urn:li:member:34155363",
+    }
+    assert page.methods_urls() == PUBLISH_CALLS
+
+
+def test_cli_account_change_before_create_exits_4_without_creating(monkeypatch, png):
+    page = fake_session(monkeypatch, FakePage({**ALL_OK, ("GET", ME): [ME_OK, me_as(OTHER)]}))
+
+    result, _ = cli("--text", "hi", "--image", str(png), "--confirm")
+
+    assert result.exit_code == 4
+    assert "REFUSED: the signed-in account changed" in result.output
+    assert ("POST", CREATE) not in page.methods_urls()
 
 
 def test_cli_not_logged_in_exits_4(monkeypatch, png):
@@ -485,13 +748,13 @@ def test_browser_close_error_never_hides_publish_result(monkeypatch, png):
     monkeypatch.setattr(post, "assert_profile_idle", lambda: None)
     monkeypatch.setattr(post, "open_context", open_context)
 
-    out = asyncio.run(post.create_post("hi", post.load_image(str(png)), publish_now=True))
+    out = asyncio.run(post.create_post("hi", post.load_image(str(png)), publish_now=True, expect_author="test-author"))
     assert out["urn"] == SHARE
 
     page.calls.clear()
     page.responses = {**ALL_OK, ("POST", CREATE): resp(503)}
     with pytest.raises(RuntimeError, match="may be live"):
-        asyncio.run(post.create_post("hi", post.load_image(str(png)), publish_now=True))
+        asyncio.run(post.create_post("hi", post.load_image(str(png)), publish_now=True, expect_author="test-author"))
 
 
 def test_busy_profile_stops_before_chrome_launch(monkeypatch, png):

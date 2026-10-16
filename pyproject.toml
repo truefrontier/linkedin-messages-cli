@@ -1,6 +1,6 @@
 [project]
 name = "linkedin-messages-cli"
-version = "0.4.0"
+version = "0.4.1"
 description = "Unofficial agent-native CLI for LinkedIn messaging, image posts (dry-run by default), read-only activity export, and read-only Boost stats (Chrome session)."
 readme = "README.md"
 license = "MIT"
@@ -10,6 +10,7 @@ dependencies = [
     "playwright>=1.40.0",
     "click>=8.1.0",
     "rich>=13.0.0",
+    "tomli>=1.1.0; python_version < '3.11'",
 ]
 
 [project.scripts]

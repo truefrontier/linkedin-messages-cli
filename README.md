@@ -53,7 +53,7 @@ Never commit `chrome-profile/` or `capture/`. Never paste cookies or tokens into
 | `limsg boost list [--since DATE] [--until DATE] [--account ID]` | Every boosted campaign across your personal Boost ad accounts (READ-ONLY) |
 | `limsg boost stats <share-urn\|activity-urn\|campaign-id> [--since DATE] [--until DATE]` | Spend, impressions, clicks, CTR, and review status for one boost (READ-ONLY) |
 | `limsg post create --text "…" \| --text-file PATH --image PATH` | Text + one image post. **Dry-run by default** |
-| `limsg post create … --confirm` | Actually publish (`--dry-run` still wins) |
+| `limsg post create … --confirm` | Actually publish (`--dry-run` still wins), only if signed in as the expected author |
 | `limsg agent-help [COMMAND]` | Usage notes written for agents (e.g. `limsg agent-help post create`) |
 
 ### Agent UX
@@ -182,25 +182,43 @@ If the session is missing or Campaign Manager wants sign-in, `boost` exits `4`. 
 
 ### Post with an image (dry-run by default)
 
-`post create` publishes one post, text plus exactly one image, as the signed-in personal account.
+`post create` publishes one post, text plus exactly one image, as the signed-in personal account. LinkedIn's create call names no author: the post goes out from whichever account the Chrome session is signed in to. So every run checks that account against the expected author first.
 
 ```bash
 limsg post create --text "Shipping today." --image card.png              # dry-run: prints what would post
 limsg post create --text-file post.txt --image card.jpg --format json    # dry-run, JSON
 limsg post create --text-file post.txt --image card.jpg --confirm        # publishes for real
+limsg post create --text "…" --image card.png --expect-author someone-else  # expect a different account
 ```
 
-- **Without `--confirm` nothing is uploaded or posted.** A dry-run validates the inputs, checks the session is logged in (one read: `GET /voyager/api/me`), and prints the author, the full text, and the image path, type, size, and dimensions. `--dry-run --confirm` is still a dry-run.
+**Author check.** The signed-in handle (the `HANDLE` in `linkedin.com/in/HANDLE`) must equal the expected author, ignoring case. The expected author comes from the first of these that is set:
+
+1. `--expect-author HANDLE`
+2. `LIMSG_EXPECT_AUTHOR`
+3. `expect_author` in `~/.linkedin-messages-cli/config.toml` (top-level key), then `~/.linkedin-messages-cli/config.json`
+4. the built-in default, `kevnk`
+
+```toml
+# ~/.linkedin-messages-cli/config.toml
+expect_author = "kevnk"
+```
+
+- Dry-run on a mismatch prints `WARNING: AUTHOR MISMATCH …`, still prints the preview, and exits `4`.
+- `--confirm` on a mismatch prints `REFUSED: …` and exits `4`. Nothing is uploaded or posted.
+- `--confirm` re-reads `GET /voyager/api/me` right before the create call. If the account changed, or can't be read, it refuses (`REFUSED: … Nothing was posted.`, exit `4`). The image is uploaded by then but never attached to a post.
+- The author is the profile that `/me` points to (`data["*miniProfile"]`), not just the first profile in the response.
+
+- **Without `--confirm` nothing is uploaded or posted.** A dry-run validates the inputs, checks the session is logged in (one read: `GET /voyager/api/me`), and prints the author (name, handle, profile URN, member URN), the expected author and whether it matches, the full text, and the image path, type, size, and dimensions. `--dry-run --confirm` is still a dry-run.
 - `--text` and `--text-file` (UTF-8) are mutually exclusive; one is required. Text is trimmed and must be non-empty and at most 3000 characters, counted like LinkedIn's composer (UTF-16 units, so an emoji counts 2). Hashtags and @names go out as plain text, not links.
 - `--image` must be JPEG, PNG, or GIF, judged by the file's magic bytes rather than its extension, and at most 10 MB. LinkedIn accepts larger images; 10 MB keeps the single in-page upload small.
-- Output is JSON when piped or with `--format json`, text on a TTY or with `--format text`. Dry-run fields: `dryRun`, `loggedIn`, `author` (`name`, `publicIdentifier`, `profileUrn`, `memberUrn`), `text`, `textLength`, `image` (`path`, `filename`, `type`, `bytes`, `width`, `height`). `--confirm` adds `posted`, `urn`, `url` (`https://www.linkedin.com/feed/update/<urn>/`), and `image.assetUrn`.
-- Exit codes: `2` bad input (checked before Chrome opens), `4` not logged in, `5` API error or Chrome profile busy.
+- Output is JSON when piped or with `--format json`, text on a TTY or with `--format text`. Dry-run fields: `dryRun`, `loggedIn`, `author` (`name`, `publicIdentifier`, `profileUrn`, `memberUrn`, all from the live session), `expectedAuthor`, `authorMatches`, `text`, `textLength`, `image` (`path`, `filename`, `type`, `bytes`, `width`, `height`). `--confirm` adds `posted` (`false` when refused); a published post also gets `urn`, `url` (`https://www.linkedin.com/feed/update/<urn>/`), and `image.assetUrn`.
+- Exit codes: `2` bad input or unreadable config (checked before Chrome opens), `4` not logged in or author mismatch, `5` API error or Chrome profile busy.
 
 If `--confirm` fails, the message says whether anything can be live:
 
 - Register or upload failed, or LinkedIn rejected the create with a 4xx: nothing was posted.
 - Create got a 5xx or no response: the post **may be live**. Check your profile before retrying.
-- Create returned 2xx but no post URN: the post is live. The command exits `0` with `urn: null` and a `warning`. Do not re-run it, or it will post twice.
+- Create returned 2xx but no post URN: the post is live. The command exits `0` with `urn: null` and a `warning`. Do not re-run it, or it will post twice. (The URN is read only from `data.status.urn`, `value.urn`, or the `x-restli-id` header, never guessed from other URNs in the response, which can belong to other posts.)
 
 ## How it talks to LinkedIn
 
@@ -225,6 +243,7 @@ Prefer replaying Voyager / Messaging GraphQL with the page’s own cookies (no c
   - `GET /voyager/api/me` (login check + author)
   - `POST /voyager/api/voyagerVideoDashMediaUploadMetadata?action=upload` with `{"mediaUploadType":"IMAGE_SHARING","fileSize":N,"filename":"…"}` → asset urn + `singleUploadUrl`
   - `PUT {singleUploadUrl}` (image bytes; must be an `https://*.linkedin.com` URL)
+  - `GET /voyager/api/me` again (author re-check; refuses if the account changed)
   - `POST /voyager/api/contentcreation/normShares` with `commentaryV2` and `media: [{"category":"IMAGE","mediaUrn":…}]` → post urn from `data.status.urn`, else the `x-restli-id` header
   - These shapes match OSS Voyager clients (gabros20/linkedin-relay reports `normShares` returning 201 live on 2026-08-13). This repo has never run them live; only the dry-run has touched a real session.
 
@@ -236,7 +255,7 @@ Prefer replaying Voyager / Messaging GraphQL with the page’s own cookies (no c
 - **`history` / `read` are READ-ONLY** (GET only). They never call `createMessage`.
 - **`activity` is READ-ONLY.** `comments`, `reactions`, `posts`, and `export` only open Recent activity and read it. They do not post, react, comment, or send DMs, and they never call `createMessage`.
 - **`boost` is READ-ONLY:** GET only against campaign-manager-api; never edits, pauses, resumes, deletes, or changes budgets; never opens Campaign Manager UI pages. It never calls `?action=` endpoints such as `fetchCurrentRunningSpend` or `billingConfiguration`.
-- **`post create` never posts without `--confirm`**, and `--dry-run` overrides `--confirm`. Writes run once each: no retries, no redirects followed.
+- **`post create` never posts without `--confirm`**, and `--dry-run` overrides `--confirm`. It refuses unless the signed-in handle is the expected author (default `kevnk`), checked before the first write and again right before the create. Writes run once each: no retries, no redirects followed.
 - Do not blast Boardy or anyone. Prefer `messages list` / `messages history` for smoke tests; dry-run send only on throwaway threads.
 
 ## License

@@ -4,10 +4,13 @@ Dry-run is the default. A dry-run validates the inputs and makes one read:
 
   GET  /voyager/api/me                                                   (login check + author)
 
-Only `limsg post create --confirm` (without --dry-run) makes the three writes, in order:
+normShares has no author field: LinkedIn posts as whichever account the session is signed in to.
+So `limsg post create --confirm` (without --dry-run) writes only when that account's handle is
+the expected author (--expect-author, $LIMSG_EXPECT_AUTHOR, config, else "kevnk"), in order:
 
   POST /voyager/api/voyagerVideoDashMediaUploadMetadata?action=upload    (register image)
   PUT  {singleUploadUrl}                                                 (image bytes)
+  GET  /voyager/api/me                                                   (author re-check)
   POST /voyager/api/contentcreation/normShares                           (create post)
 
 Every call is an in-page fetch from https://www.linkedin.com/robots.txt (same origin,
@@ -21,6 +24,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import re
 import struct
 from contextlib import asynccontextmanager
@@ -30,7 +34,12 @@ from urllib.parse import unquote, urlparse
 
 from limsg_cli.activity import AuthRequired, _auth_wall, assert_profile_idle
 from limsg_cli.api import _page_fetch
-from limsg_cli.browser import csrf_from_cookies, has_session, open_context, voyager_headers
+from limsg_cli.browser import HOME, csrf_from_cookies, has_session, open_context, voyager_headers
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10
+    import tomli as tomllib
 
 MAX_TEXT = 3000
 # LinkedIn's share box accepts larger images, but 10 MB keeps the single in-page upload small.
@@ -43,6 +52,9 @@ CREATE_URL = f"{VOYAGER}/contentcreation/normShares"
 LANDING_URL = "https://www.linkedin.com/robots.txt"
 FEED_UPDATE = "https://www.linkedin.com/feed/update/{urn}/"
 AUTH_MESSAGE = "LinkedIn session expired or not signed in."
+EXPECT_AUTHOR_ENV = "LIMSG_EXPECT_AUTHOR"
+DEFAULT_EXPECT_AUTHOR = "kevnk"
+CONFIG_FILES = (HOME / "config.toml", HOME / "config.json")
 
 _MAGIC = (
     (b"\x89PNG\r\n\x1a\n", "image/png"),
@@ -51,6 +63,10 @@ _MAGIC = (
     (b"GIF89a", "image/gif"),
 )
 _POST_URN = re.compile(r"urn:li:(?:share|ugcPost|activity):\d+")
+
+
+class AuthorRefused(AuthRequired):
+    """The signed-in account could not be confirmed as the expected author. Nothing was posted."""
 
 
 # ---------------------------------------------------------------- validation (no network)
@@ -130,6 +146,53 @@ def image_summary(image: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in image.items() if k != "data"}
 
 
+def _config_expect_author() -> Any:
+    for path in CONFIG_FILES:
+        if not path.is_file():
+            continue
+        try:
+            raw = path.read_text(encoding="utf-8")
+            config = json.loads(raw) if path.suffix == ".json" else tomllib.loads(raw)
+        except (OSError, ValueError) as exc:  # decode errors of both formats are ValueErrors
+            raise ValueError(f"Cannot read config {path}: {exc}") from exc
+        if not isinstance(config, dict):
+            raise ValueError(f"Config {path} must be a JSON object.")
+        if "expect_author" in config:
+            return config["expect_author"]
+    return None
+
+
+def resolve_expect_author(flag: str | None) -> str:
+    """--expect-author, else $LIMSG_EXPECT_AUTHOR, else expect_author in config.toml then config.json, else kevnk."""
+    value: Any = flag if flag is not None else os.environ.get(EXPECT_AUTHOR_ENV)
+    if value is None:
+        value = _config_expect_author()
+    if value is None:
+        value = DEFAULT_EXPECT_AUTHOR
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"Expected author must be a LinkedIn handle (the part after linkedin.com/in/), got {value!r}.")
+    return value.strip()
+
+
+def author_matches(author: dict[str, Any], expected: str) -> bool:
+    return str(author.get("publicIdentifier") or "").casefold() == expected.casefold()
+
+
+def mismatch_message(author: dict[str, Any], expected: str) -> str:
+    return (
+        f"Signed in as {_who(author)}, but the expected author is {expected}. "
+        f"Sign in as {expected} with `limsg login`."
+    )
+
+
+def _who(author: dict[str, Any]) -> str:
+    return f"{author.get('name') or '(no name)'} ({author.get('publicIdentifier')}, {author.get('memberUrn')})"
+
+
+def _identity(author: dict[str, Any]) -> tuple:
+    return str(author.get("publicIdentifier") or "").casefold(), author.get("profileUrn"), author.get("memberUrn")
+
+
 # ---------------------------------------------------------------- response parsing
 
 
@@ -143,23 +206,35 @@ def _value(data: Any) -> dict:
 
 
 def parse_me(data: Any) -> dict[str, Any] | None:
-    """Author from GET /voyager/api/me, or None when the payload has no profile."""
+    """Signed-in author from GET /voyager/api/me, or None unless the payload pins down one profile.
+
+    `included` can hold other people's profiles, so the author is the one data["*miniProfile"]
+    (or data.miniProfile.entityUrn) points at. Without that pointer, only a lone profile counts.
+    It must carry a profile urn and a member urn, so the author re-check compares real ids.
+    """
     if not isinstance(data, dict):
         return None
     inner = data.get("data") if isinstance(data.get("data"), dict) else data
-    candidates = [o for o in data.get("included") or [] if isinstance(o, dict)]
-    if isinstance(inner.get("miniProfile"), dict):
-        candidates.append(inner["miniProfile"])
-    profile = next((o for o in candidates if o.get("publicIdentifier")), None)
-    if profile is None:
+    mini = inner.get("miniProfile") if isinstance(inner.get("miniProfile"), dict) else {}
+    candidates = [
+        o for o in [*(data.get("included") or []), mini] if isinstance(o, dict) and o.get("publicIdentifier")
+    ]
+    ref = inner.get("*miniProfile") or mini.get("entityUrn")
+    if ref:
+        candidates = [o for o in candidates if ref in (o.get("entityUrn"), o.get("dashEntityUrn"))]
+    if len(candidates) != 1:
         return None
+    profile = candidates[0]
     urn = str(profile.get("dashEntityUrn") or profile.get("entityUrn") or "")
     plain_id = inner.get("plainId")
+    member_urn = profile.get("objectUrn") or (f"urn:li:member:{plain_id}" if plain_id else None)
+    if not urn or not member_urn:
+        return None
     return {
         "name": f"{profile.get('firstName') or ''} {profile.get('lastName') or ''}".strip(),
         "publicIdentifier": profile.get("publicIdentifier"),
-        "profileUrn": urn.replace("fs_miniProfile", "fsd_profile") or None,
-        "memberUrn": profile.get("objectUrn") or (f"urn:li:member:{plain_id}" if plain_id else None),
+        "profileUrn": urn.replace("fs_miniProfile", "fsd_profile"),
+        "memberUrn": member_urn,
     }
 
 
@@ -176,12 +251,11 @@ def parse_register(data: Any) -> tuple[str, str, dict[str, str]]:
     return str(urn), str(url), {str(k): str(v) for k, v in headers.items()} if isinstance(headers, dict) else {}
 
 
-def parse_created_urn(data: Any, text: str, restli_id: str | None = None) -> str | None:
-    """Post urn from the create response.
+def parse_created_urn(data: Any, restli_id: str | None = None) -> str | None:
+    """Post urn from the create response: data.status.urn, value.urn, else the x-restli-id header.
 
-    data.status.urn is where text-only clients read it, then the Rest.li x-restli-id header.
-    The body of an image post has not been published anywhere, so last comes the first post
-    urn in the body, after removing the echoed post text (which may itself contain a urn).
+    Never "some post urn somewhere in the body": that can be another post (even someone
+    else's). With no urn, the caller reports the post as live but unidentified.
     """
     value = _value(data)
     for holder in (value.get("status"), value):
@@ -190,12 +264,6 @@ def parse_created_urn(data: Any, text: str, restli_id: str | None = None) -> str
             if m:
                 return m.group(0)
     m = _POST_URN.fullmatch(unquote(restli_id or ""))
-    if m:
-        return m.group(0)
-    if not isinstance(data, dict):
-        return None
-    blob = json.dumps(data).replace(json.dumps(text)[1:-1], "")
-    m = _POST_URN.search(blob)
     return m.group(0) if m else None
 
 
@@ -279,8 +347,21 @@ def _check_upload_url(url: str) -> None:
         raise RuntimeError(f"Refusing image upload to unexpected URL host {parts.netloc!r}. Nothing was posted.")
 
 
-async def publish(page, text: str, image: dict[str, Any]) -> dict[str, Any]:
-    """Register -> upload -> create. Each step runs once; a failure stops before the next write."""
+async def _recheck_author(page, author: dict[str, Any], expected: str) -> None:
+    """Re-read /me right before the create; refuse unless it is still the same, expected account."""
+    try:
+        now = await fetch_author(page)
+    except Exception as exc:
+        raise AuthorRefused(f"REFUSED: could not re-check the signed-in account ({exc}). Nothing was posted.") from exc
+    if _identity(now) != _identity(author) or not author_matches(now, expected):
+        raise AuthorRefused(
+            f"REFUSED: the signed-in account changed from {_who(author)} to {_who(now)} before the post "
+            f"was created (expected {expected}). Nothing was posted."
+        )
+
+
+async def publish(page, text: str, image: dict[str, Any], *, author: dict[str, Any], expected: str) -> dict[str, Any]:
+    """Register -> upload -> author re-check -> create. Each write runs once; a failure stops before the next."""
     status, data, _ = await _write(
         page,
         REGISTER_URL,
@@ -297,6 +378,9 @@ async def publish(page, text: str, image: dict[str, Any]) -> dict[str, Any]:
     if not 200 <= status < 300:
         raise RuntimeError(f"Image upload failed HTTP {status}. Nothing was posted.")
 
+    # The create carries no author, so this is the last chance to catch a different account.
+    # A session swap after this read and before the create would still post as the new account.
+    await _recheck_author(page, author, expected)
     status, data, restli_id = await _write(page, CREATE_URL, json_body=share_body(text, asset_urn))
     if 400 <= status < 500:
         raise RuntimeError(f"LinkedIn rejected the post (HTTP {status}). Nothing was posted.")
@@ -305,7 +389,7 @@ async def publish(page, text: str, image: dict[str, Any]) -> dict[str, Any]:
             f"Create post got {'no response' if status == 0 else f'HTTP {status}'}. The post may be live; "
             "check your profile before retrying."
         )
-    urn = parse_created_urn(data, text, restli_id)
+    urn = parse_created_urn(data, restli_id)
     out: dict[str, Any] = {"urn": urn, "url": post_url(urn) if urn else None, "assetUrn": asset_urn}
     if not urn:
         # 2xx means LinkedIn accepted it. Reporting failure here would invite a second post.
@@ -316,20 +400,25 @@ async def publish(page, text: str, image: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-async def run(page, text: str, image: dict[str, Any], *, publish_now: bool) -> dict[str, Any]:
-    """Login check, then either the dry-run preview or the publish result."""
+async def run(page, text: str, image: dict[str, Any], *, publish_now: bool, expect_author: str) -> dict[str, Any]:
+    """Login + author check, then the dry-run preview, the refusal (posted: false), or the publish result."""
     author = await fetch_author(page)
+    matches = author_matches(author, expect_author)
     out: dict[str, Any] = {
         "dryRun": not publish_now,
         "loggedIn": True,
         "author": author,
+        "expectedAuthor": expect_author,
+        "authorMatches": matches,
         "text": text,
         "textLength": utf16_len(text),
         "image": image_summary(image),
     }
     if not publish_now:
         return out
-    result = await publish(page, text, image)
+    if not matches:  # wrong account: refuse before any upload or write
+        return {**out, "posted": False}
+    result = await publish(page, text, image, author=author, expected=expect_author)
     out["image"]["assetUrn"] = result.pop("assetUrn")
     return {**out, "posted": True, **result}
 
@@ -356,6 +445,6 @@ async def _session_page():
                 pass
 
 
-async def create_post(text: str, image: dict[str, Any], *, publish_now: bool) -> dict[str, Any]:
+async def create_post(text: str, image: dict[str, Any], *, publish_now: bool, expect_author: str) -> dict[str, Any]:
     async with _session_page() as page:
-        return await run(page, text, image, publish_now=publish_now)
+        return await run(page, text, image, publish_now=publish_now, expect_author=expect_author)

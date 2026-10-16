@@ -21,14 +21,25 @@ EXIT_API = 5
 # `limsg agent-help [COMMAND]` prints these. Keyed by command path.
 AGENT_HELP: dict[str, str] = {
     "post create": """\
-limsg post create (--text STR | --text-file PATH) --image PATH [--dry-run] [--confirm] [--format json|text]
+limsg post create (--text STR | --text-file PATH) --image PATH [--dry-run] [--confirm]
+                  [--expect-author HANDLE] [--format json|text]
 
 Publishes ONE LinkedIn post (text + exactly one image) as the signed-in personal account.
+LinkedIn posts as whoever the session is signed in as; the request names no author.
 
 DRY-RUN IS THE DEFAULT. Without --confirm nothing is uploaded or posted. A dry-run validates
 the inputs, checks the session is logged in (read-only GET /voyager/api/me), and prints the
 author, the full text, and the image path, type, size, and dimensions. --dry-run together
 with --confirm is still a dry-run.
+
+AUTHOR CHECK. The signed-in handle (linkedin.com/in/<handle>) must equal the expected author,
+ignoring case. Expected author: --expect-author, else $LIMSG_EXPECT_AUTHOR, else expect_author
+in ~/.linkedin-messages-cli/config.toml, then config.json, else kevnk.
+  - dry-run on a mismatch: prints "WARNING: AUTHOR MISMATCH" and exits 4
+  - --confirm on a mismatch: "REFUSED", nothing uploaded or posted, exits 4
+  - --confirm re-reads /me just before the create; if the account changed: "REFUSED ...
+    Nothing was posted.", exit 4
+Never change --expect-author to get past a mismatch. Tell the human which account is signed in.
 
 --confirm publishes for real (register image -> upload -> create post). The post is public.
 Get a human to approve the exact dry-run output first. Each write is sent once; never
@@ -42,12 +53,13 @@ Inputs:
                          (counted like LinkedIn: UTF-16 units, so an emoji counts 2)
   --image                JPEG, PNG, or GIF by file contents (magic bytes); <= 10 MB
 
-Output: JSON when piped or with --format json. Dry-run: dryRun, loggedIn, author, text,
-textLength, image. --confirm adds posted, urn, url (https://www.linkedin.com/feed/update/<urn>/),
-and image.assetUrn.
+Output: JSON when piped or with --format json. Dry-run: dryRun, loggedIn, author (name,
+publicIdentifier, profileUrn, memberUrn), expectedAuthor, authorMatches, text, textLength,
+image. --confirm adds posted; when posted is true, also urn, url
+(https://www.linkedin.com/feed/update/<urn>/), and image.assetUrn.
 
-Exit codes: 0 ok, 2 bad input, 4 not logged in (run: limsg login),
-5 API error or Chrome profile busy (close the limsg Chrome window).
+Exit codes: 0 ok, 2 bad input or bad config, 4 not logged in (run: limsg login) or author
+mismatch, 5 API error or Chrome profile busy (close the limsg Chrome window).
 """,
 }
 
